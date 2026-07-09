@@ -1,0 +1,20 @@
+*.whl
+*.root
+*.out
+*.err
+*log
+*pythia8*txt
+
+# Stray local test* artifacts, but keep the tests/ package tracked.
+test*
+!tests/
+!tests/**/
+!tests/**/*.py
+
+# Python build / cache artifacts.
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/

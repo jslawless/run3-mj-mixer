@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "run3-mj-mixer"
+version = "1.0.0"
+description = "Hemisphere-mixing background model for the 6-jet multijet analysis"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "uproot>=5.0",
+    "awkward>=2.0",
+    "numpy>=1.20",
+    "boost-histogram>=1.3",
+    "fsspec_xrootd",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+run3-mj-mixer = "run3_mj_mixer.mix:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
