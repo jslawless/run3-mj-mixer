@@ -14,8 +14,8 @@ them), i.e. the output of make_eos_filelists.py:
 Grouping: each job takes ``--per-slice`` files (default 5) from EVERY slice, in
 sorted order. job_1 gets files 0-4 of each slice, job_2 gets files 5-9, and so
 on. Jobs keep forming while EVERY slice can still supply its quota; as soon as
-one slice runs out (the smallest slice sets the limit), all remaining files from
-every slice are dropped into a single 'unused' group instead of a short job.
+one slice runs out (the smallest slice sets the limit), the remaining files
+from every slice are leftovers.
 
     n_jobs = min_over_slices( n_files_in_slice // per_slice )
 
@@ -24,11 +24,12 @@ Output is a coffea-style fileset JSON whose top-level keys are the jobs:
     {
         "job_1":  { "files": { path: tree, ... } },   # per_slice * n_slices files
         ...
-        "job_N":  { "files": { ... } },
-        "unused": { "files": { ... } }                # only if non-empty
+        "job_N":  { "files": { ... } }
     }
 
-which submit_mixer.py consumes directly. To make each job_k a SINGLE condor run
+which submit_mixer.py consumes directly. Leftover files are written to a
+sidecar ``<output>_unused.json`` for bookkeeping only - they are deliberately
+NOT part of the submittable fileset (they cannot form slice-balanced jobs). To make each job_k a SINGLE condor run
 (rather than one sub-job per file), submit with ``-n`` >= the files-per-job the
 summary prints, e.g.:
 
@@ -89,9 +90,12 @@ def load_slices(inputs, only):
 
 
 def build_jobs(slices, per_slice, job_prefix):
-    """Round-robin ``per_slice`` files/slice into jobs; leftovers -> 'unused'.
+    """Round-robin ``per_slice`` files/slice into jobs.
 
-    Returns (jobs_ordereddict, n_jobs, files_per_job, n_unused).
+    Returns (jobs_ordereddict, unused_ordereddict, n_jobs, files_per_job).
+    ``unused`` holds the leftover {path: tree} once the smallest slice runs
+    out; it is bookkeeping, NOT a job group, and is kept out of ``jobs`` so
+    submit_mixer.py never turns it into condor runs.
     """
     if not slices:
         sys.exit("No slices found (check the input paths and --only filter).")
@@ -113,17 +117,15 @@ def build_jobs(slices, per_slice, job_prefix):
     for name, slice_files in slices.items():
         for path, tree in slice_files[cut:]:
             unused[path] = tree
-    if unused:
-        jobs["unused"] = {"files": unused}
 
     files_per_job = per_slice * len(slices)
-    return jobs, n_jobs, files_per_job, len(unused)
+    return jobs, unused, n_jobs, files_per_job
 
 
 def main():
     p = argparse.ArgumentParser(
         description="Group per-slice QCD filelists into mixed condor jobs "
-                    "(job_1, job_2, ... + 'unused').",
+                    "(job_1, job_2, ...; leftovers -> <output>_unused.json).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("inputs", nargs="+", metavar="JSON_OR_DIR",
@@ -141,7 +143,7 @@ def main():
         sys.exit("--per-slice must be >= 1.")
 
     slices = load_slices(args.inputs, args.only)
-    jobs, n_jobs, files_per_job, n_unused = build_jobs(
+    jobs, unused, n_jobs, files_per_job = build_jobs(
         slices, args.per_slice, args.job_prefix
     )
 
@@ -153,15 +155,22 @@ def main():
 
     if n_jobs == 0:
         print("\nWARNING: at least one slice has fewer than --per-slice files; "
-              "no complete jobs were formed - everything went to 'unused'.",
+              "no complete jobs were formed - every file is a leftover.",
               file=sys.stderr)
 
     with open(args.output, "w") as f:
         json.dump(jobs, f, indent=4)
 
-    print(f"\nWrote {n_jobs} job(s) x {files_per_job} files"
-          + (f" + 'unused' ({n_unused} files)" if n_unused else "")
-          + f" -> {args.output}")
+    print(f"\nWrote {n_jobs} job(s) x {files_per_job} files -> {args.output}")
+
+    if unused:
+        stem, ext = os.path.splitext(args.output)
+        unused_path = f"{stem}_unused{ext or '.json'}"
+        with open(unused_path, "w") as f:
+            json.dump({"unused": {"files": unused}}, f, indent=4)
+        print(f"Leftover files (bookkeeping only, do NOT submit): "
+              f"{len(unused)} -> {unused_path}")
+
     if n_jobs:
         print(f"\nSubmit each job as ONE condor run with:  -n {files_per_job}")
 

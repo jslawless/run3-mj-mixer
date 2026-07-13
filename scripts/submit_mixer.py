@@ -197,6 +197,11 @@ class Fileset:
             raise SystemExit(f"Invalid JSON in {self.infile}: {e}")
 
     def _split(self):
+        # 'unused' is make_mixing_jobs.py's leftover bucket (older versions put
+        # it in the main fileset) - bookkeeping, never a job group.
+        if "unused" in self.fileset:
+            n_skip = len(self.fileset.pop("unused").get("files", {}))
+            print(f"\n  Skipping 'unused' ({n_skip} leftover files, not a job group).")
         print(f"\nDatasets: {len(self.fileset)}")
         total = 0
         for k, (dataset, data) in enumerate(self.fileset.items()):

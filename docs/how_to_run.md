@@ -38,9 +38,10 @@ full spectrum. Build the job-grouped fileset:
 python scripts/make_mixing_jobs.py filelists/ --only QCD -o mixing_jobs.json
 ```
 
-This makes `job_1`, `job_2`, ... (5 files/slice each by `--per-slice`) plus an
-`unused` group for the leftovers once the smallest slice runs out. The summary
-prints the files-per-job for the `-n` below.
+This makes `job_1`, `job_2`, ... (5 files/slice each by `--per-slice`). Once the
+smallest slice runs out, the leftover files go to a `mixing_jobs_unused.json`
+sidecar — bookkeeping only, they are not submitted (they can't form
+slice-balanced jobs). The summary prints the files-per-job for the `-n` below.
 
 ## 5. Submit
 ```

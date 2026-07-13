@@ -76,11 +76,12 @@ locates the xs JSON from the aux sibling, `$RUN3_MJ_XS_JSON`, `--xs-json`, or a
 `scripts/make_mixing_jobs.py` groups per-slice filelists so each condor run
 spans **all** QCD HT slices (a representative sample for the library). Each job
 takes `--per-slice` files (default 5) from every slice; once the smallest slice
-runs out, the remaining files go to an `unused` group:
+runs out, the leftover files are written to a `<output>_unused.json` sidecar
+(bookkeeping only — never submitted):
 
 ```
 python scripts/make_mixing_jobs.py filelists/ --only QCD -o mixing_jobs.json
-# -> job_1, job_2, ... (5 files/slice each) + unused
+# -> job_1, job_2, ... (5 files/slice each); leftovers -> mixing_jobs_unused.json
 ```
 
 The output is a coffea-style fileset consumed by `submit_mixer.py`; submit with
