@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """mix.py - hemisphere-mixing prototype for the 6-jet multijet analysis.
 
-Reads a slimmed ROOT file (produced by run3-mj-slimmer) and, for every event:
+Reads a slimmed ROOT file (produced by run3-mj-slimmer) and, for every event
+with exactly ``mixer.n_jets`` jets (others are dropped):
   1. finds the transverse thrust axis n_T (in the transverse x-y plane),
   2. splits the event into two hemispheres by the plane perpendicular to n_T,
   3. sums the jet four-vectors in each hemisphere.
@@ -17,6 +18,8 @@ through unchanged) plus:
                       multiplicity n_jets, and the side (+1 = along +n_T).
   - TH1  'thrust_axis_phi'  : histogram of the per-event thrust-axis angle.
   - TH1  'hemisphere_njets' : histogram of the per-hemisphere jet multiplicity.
+  - TH1  'mixer_cutflow'    : bin 1 = events read, bin 2 = events with exactly
+                              n_jets jets (the ones written out).
   - TH1  'version'          : mixer config metadata.version string.
   - TTree 'meta'            : mixer version, config version, scan parameters.
   - 'cutflow' and 'slimmer_version' are passed through from the input if present.
@@ -38,7 +41,7 @@ Config JSON format:
         "mixer": {
             "thrust_scan_points": 180,
             "hist_bins":          90,
-            "min_jets":           1
+            "n_jets":             5
         }
     }
 """
@@ -70,7 +73,7 @@ _REQUIRED_METADATA_KEYS = {
 _REQUIRED_MIXER_KEYS = {
     "thrust_scan_points": int,
     "hist_bins":          int,
-    "min_jets":           int,
+    "n_jets":             int,
 }
 
 
@@ -108,6 +111,8 @@ def load_config(config_path: str) -> dict:
         sys.exit("Config 'mixer.thrust_scan_points' must be >= 2.")
     if cfg["mixer"]["hist_bins"] < 1:
         sys.exit("Config 'mixer.hist_bins' must be >= 1.")
+    if cfg["mixer"]["n_jets"] < 1:
+        sys.exit("Config 'mixer.n_jets' must be >= 1.")
 
     return cfg
 
@@ -362,8 +367,8 @@ def hemisphere_fourvectors(pt, eta, phi, m, phi_T):
                       transverse_thrust().
 
     Returns a dict of (events, 2) numpy arrays (index 0 = +n_T side): px, py,
-    pz, energy, pt, eta, phi, mass, pt_par, pt_perp, n_jets (int32), side
-    (int32, +1/-1).
+    pz, energy, pt, eta, phi, mass, pt_par, pt_perp, partner_eta (eta of the
+    event's other hemisphere), n_jets (int32), side (int32, +1/-1).
     """
     cos_t = np.cos(phi_T)          # (events,)
     sin_t = np.sin(phi_T)
@@ -415,6 +420,9 @@ def hemisphere_fourvectors(pt, eta, phi, m, phi_T):
             out[name] = stacked.astype(np.int32)
         else:
             out[name] = stacked.astype(np.float32)
+    # eta of the event's other hemisphere: the eta column with the sides
+    # swapped (an empty partner keeps the pt==0 -> eta=0 convention).
+    out["partner_eta"] = out["eta"][:, ::-1].copy()
     return out
 
 
@@ -428,11 +436,13 @@ def mix(input_path, output_path, config, config_path, in_tree_name, chunk_size,
     version   = config["metadata"]["version"]
     n_scan    = int(config["mixer"]["thrust_scan_points"])
     hist_bins = int(config["mixer"]["hist_bins"])
+    n_jets_req = int(config["mixer"]["n_jets"])
 
     print(f"Input:   {input_path}  (tree: {in_tree_name})")
     print(f"Output:  {output_path}  (tree: events)")
     print(f"Version: {version}  ({config_path})")
     print(f"Thrust:  transverse axis via {n_scan}-point scan on [0, pi) + parabolic refine")
+    print(f"Cut:     exactly {n_jets_req} jets per event")
 
     with uproot.open(input_path) as in_file:
         tree_name = in_tree_name
@@ -448,6 +458,7 @@ def mix(input_path, output_path, config, config_path, in_tree_name, chunk_size,
                 print(f"No '{in_tree_name}' tree in {input_path} (empty slice) -> "
                       "writing cutflow-only output.")
                 with uproot.recreate(output_path) as out_file:
+                    out_file["mixer_cutflow"] = _mixer_cutflow_hist(0, 0)
                     _write_passthrough_hists(in_file, out_file)
                     _write_version_and_meta(out_file, config)
                 return
@@ -489,11 +500,19 @@ def mix(input_path, output_path, config, config_path, in_tree_name, chunk_size,
             bh.axis.Regular(20, 0.0, 20.0), storage=bh.storage.Double()
         )
 
+        total_read = 0
         total = 0
         with uproot.recreate(output_path) as out_file:
             out_tree = None
 
             for chunk in tree.iterate(library="ak", step_size=chunk_size):
+                total_read += len(chunk)
+
+                # 0) exact-multiplicity cut
+                pt, eta, phi, m = jet_subarrays(chunk)
+                keep = ak.num(pt, axis=1) == n_jets_req
+                chunk = chunk[keep]
+                pt, eta, phi, m = pt[keep], eta[keep], phi[keep], m[keep]
                 n_chunk = len(chunk)
                 if n_chunk == 0:
                     continue
@@ -503,7 +522,6 @@ def mix(input_path, output_path, config, config_path, in_tree_name, chunk_size,
                 out_record = _passthrough_branches(chunk, _REGROUP_COLLECTIONS)
 
                 # 2) transverse thrust axis
-                pt, eta, phi, m = jet_subarrays(chunk)
                 px = pt * np.cos(phi)
                 py = pt * np.sin(phi)
                 sum_pt = ak.to_numpy(ak.sum(pt, axis=1))
@@ -541,10 +559,20 @@ def mix(input_path, output_path, config, config_path, in_tree_name, chunk_size,
 
             out_file["thrust_axis_phi"]  = thrust_hist
             out_file["hemisphere_njets"] = njet_hist
+            out_file["mixer_cutflow"]    = _mixer_cutflow_hist(total_read, total)
             _write_passthrough_hists(in_file, out_file)
             _write_version_and_meta(out_file, config, winfo)
 
-    print(f"\nDone.   {total:,} events  ->  {output_path}")
+    print(f"\nDone.   {total:,} / {total_read:,} events with exactly "
+          f"{n_jets_req} jets  ->  {output_path}")
+
+
+def _mixer_cutflow_hist(n_read, n_pass):
+    """Two-bin cutflow: bin 1 = events read, bin 2 = events passing the
+    exact-n_jets cut (the events written to the output tree)."""
+    h = bh.Histogram(bh.axis.Regular(2, 0.0, 2.0), storage=bh.storage.Double())
+    h.view()[:] = [n_read, n_pass]
+    return h
 
 
 def _write_passthrough_hists(in_file, out_file):
@@ -578,7 +606,7 @@ def _write_version_and_meta(out_file, config, winfo=None):
     meta_record = {
         "thrust_scan_points": np.array([config["mixer"]["thrust_scan_points"]], dtype=np.int32),
         "hist_bins":          np.array([config["mixer"]["hist_bins"]],          dtype=np.int32),
-        "min_jets":           np.array([config["mixer"]["min_jets"]],           dtype=np.int32),
+        "n_jets":             np.array([config["mixer"]["n_jets"]],             dtype=np.int32),
         "lumi":               np.array([_f(winfo.get("lumi"))],       dtype=np.float64),
         "xs_pb":              np.array([_f(winfo.get("xs_pb"))],      dtype=np.float64),
         "n_original":         np.array([_f(winfo.get("n_original"))], dtype=np.float64),

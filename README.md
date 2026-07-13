@@ -18,7 +18,8 @@ arXiv:1712.02538 / arXiv:2403.20241 for the method.
 This implementation covers the per-event **split + hemisphere characterization**.
 The library, nearest-neighbor matching and 5→6 stitching are not implemented yet.
 
-For every event in a slimmed file, `mix.py`:
+For every event in a slimmed file with **exactly `n_jets` jets** (config,
+default 5 — others are dropped), `mix.py`:
 1. finds the **transverse thrust axis** `n_T` in the x–y plane, by maximizing
    `H(φ) = Σᵢ |p⃗_T,i · n̂(φ)|` over the axis angle (grid scan on `[0, π)` +
    parabolic refine; `H` is π-periodic so the axis lives on `[0, π)`);
@@ -36,6 +37,7 @@ through unchanged) plus:
 | `events` | TTree | + `thrust_axis_phi` (rad, `[0,π)`), `thrust` (normalized value `(0,1]`), `xs_weight` (per-event MC weight), and a `Hemisphere` collection (2/event, index 0 = `+n_T` side) |
 | `thrust_axis_phi` | TH1 | histogram of the per-event thrust-axis angle |
 | `hemisphere_njets` | TH1 | histogram of the per-hemisphere jet multiplicity |
+| `mixer_cutflow` | TH1 | bin 1 = events read, bin 2 = events with exactly `n_jets` jets (written out) |
 | `version`, `dataset` | TH1 | mixer config `metadata.version` string; matched HT-slice name |
 | `meta` | TTree | scan parameters + xsec bookkeeping (`lumi`, `xs_pb`, `n_original`, `xs_weight`) |
 | `cutflow`, `slimmer_version` | TH1 | passed through from the slimmer if present |
@@ -43,6 +45,7 @@ through unchanged) plus:
 `Hemisphere` fields (per hemisphere): the summed four-vector as both cartesian
 (`px, py, pz, energy`) and physics (`pt, eta, phi, mass`) form, its
 thrust-projected transverse components (`pt_par` along `n_T`, `pt_perp` ⊥ to it),
+`partner_eta` (the eta of the event's *other* hemisphere's summed four-vector),
 the jet multiplicity `n_jets`, `side` (+1/−1), and the cross-section `weight`
 (see below). These are the variables the next step (library + matching) will use.
 
@@ -104,15 +107,15 @@ Condor submission and filelist generation: see `docs/how_to_run.md`.
     "mixer": {
         "thrust_scan_points": 180,
         "hist_bins":          90,
-        "min_jets":           1
+        "n_jets":             5
     }
 }
 ```
 
 - `thrust_scan_points` — grid points on `[0, π)` for the thrust-axis scan.
 - `hist_bins` — bins of the `thrust_axis_phi` histogram over `[0, π)`.
-- `min_jets` — reserved for later selection (currently informational; the
-  prototype processes every event in the input).
+- `n_jets` — keep only events with exactly this many jets (5 for the 5→6
+  mixing); the selection is recorded in the `mixer_cutflow` histogram.
 
 ## Tests
 

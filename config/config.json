@@ -1,0 +1,10 @@
+{
+    "metadata": {
+        "version": "v1"
+    },
+    "mixer": {
+        "thrust_scan_points": 180,
+        "hist_bins":          90,
+        "n_jets":             5
+    }
+}
