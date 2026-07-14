@@ -355,12 +355,16 @@ def transverse_thrust(px, py, sum_pt, n_scan):
 # Hemisphere four-vectors
 # ---------------------------------------------------------------------------
 
-def hemisphere_fourvectors(pt, eta, phi, m, phi_T):
+def hemisphere_fourvectors(pt, eta, phi, m, phi_T, pos_mask=None):
     """Split jets on the plane perpendicular to n_T and sum the four-vectors.
 
     A jet joins hemisphere index 0 (the +n_T side) when its transverse-momentum
     projection on the thrust axis is > 0, else hemisphere index 1 (the -n_T
-    side). Each hemisphere's jet four-vectors are summed.
+    side). Each hemisphere's jet four-vectors are summed. ``pos_mask``
+    overrides the geometric assignment with an explicit per-jet membership
+    (True -> hemisphere index 0) - the stitcher uses this to sum the two
+    stitched halves by parentage; the ``side`` slots are then labels, not a
+    geometric guarantee.
 
     pt, eta, phi, m : jagged (events, var jets) awkward arrays.
     phi_T           : (events,) numpy array, the thrust-axis angle from
@@ -378,8 +382,11 @@ def hemisphere_fourvectors(pt, eta, phi, m, phi_T):
     pz = pt * np.sinh(eta)
     energy = np.sqrt((pt * np.cosh(eta)) ** 2 + m ** 2)
 
-    proj = px * cos_t + py * sin_t         # jagged: per-jet projection on n_T
-    pos = proj > 0.0
+    if pos_mask is None:
+        proj = px * cos_t + py * sin_t     # jagged: per-jet projection on n_T
+        pos = proj > 0.0
+    else:
+        pos = pos_mask
 
     def _sum(arr, mask):
         return ak.to_numpy(ak.sum(ak.where(mask, arr, 0.0), axis=1))

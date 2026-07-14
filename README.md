@@ -13,10 +13,17 @@ events into synthetic multijet "pseudo-events" that carry QCD kinematics but no
 genuine signal correlations. See `../mixer-slides/mixer-method.pdf` and
 arXiv:1712.02538 / arXiv:2403.20241 for the method.
 
-## Status: prototype (Steps 1–2)
+## Status
 
-This implementation covers the per-event **split + hemisphere characterization**.
-The library, nearest-neighbor matching and 5→6 stitching are not implemented yet.
+- **Steps 1–2** (`run3-mj-mixer`, `mix.py`): per-event split + hemisphere
+  characterization — slimmed 5-jet events → `mixed_*.root`.
+- **Step 3** (`library.py`): `HemisphereLibrary` — 4-coordinate
+  nearest-neighbor matching (pT/pT_max, directed φ, cross-matched η pair),
+  usage budgets from stochastic weight rounding, symmetric pair blacklist.
+- **Step 4** (`run3-mj-stitch`, `stitch.py`): production 5→6 stitching —
+  random draws + matching + φ→−φ reflection (the only transform; hemispheres
+  are never rotated) → weight-1 six-jet pseudo-events, evaluator-compatible
+  output with `match_distance` and parent provenance.
 
 For every event in a slimmed file with **exactly `n_jets` jets** (config,
 default 5 — others are dropped), `mix.py`:

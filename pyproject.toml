@@ -21,6 +21,7 @@ test = ["pytest>=7"]
 
 [project.scripts]
 run3-mj-mixer = "run3_mj_mixer.mix:main"
+run3-mj-stitch = "run3_mj_mixer.stitch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
