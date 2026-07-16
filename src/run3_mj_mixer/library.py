@@ -12,11 +12,12 @@ pT-balance requirement plus a nearest-neighbor search in two coordinates:
   * directed phi    - the thrust-axis angle SIGNED by which end of the axis
                       the hemisphere points along (axis phi for the +n_T
                       side, phi + pi for the -n_T side; 2pi-periodic). The
-                      query is the phi -> -phi mirror of where the seed's
-                      LOST partner pointed, so the reflection at stitch time
-                      lands the match opposite the seed - with the correct
-                      side built into the coordinate, no rotation is ever
-                      applied (phi is physical in the detector);
+                      query is simply the OPPOSITE of the seed's direction
+                      (where its lost partner pointed): the match must
+                      NATURALLY point back at the seed. No reflection,
+                      rotation or mirroring is ever applied - jet
+                      four-vectors are never modified (phi is physical in
+                      the detector);
   * partner eta     - the candidate's OWN eta must sit where the seed's
                       discarded partner was (candidate.eta ~
                       seed.partner_eta), so the pseudo-event keeps the seed
@@ -71,11 +72,6 @@ class Hemisphere:
         return len(self.jet_pt)
 
 
-def reflect_phi(phi):
-    """The reflection phi -> -phi on the [0, pi) thrust-axis range."""
-    return (-phi) % _PI
-
-
 def directed_phi(thrust_phi, side):
     """The transverse direction a hemisphere points along, in [0, 2pi):
     the thrust-axis angle for the +n_T side, + pi for the -n_T side.
@@ -85,10 +81,10 @@ def directed_phi(thrust_phi, side):
 
 
 def query_direction(seed):
-    """Where the seed's ideal new partner points, in the library frame: the
-    phi -> -phi mirror of the seed's lost partner's direction,
-    (-(alpha_seed + pi)) mod 2pi = pi - alpha_seed."""
-    return (_PI - directed_phi(seed.thrust_phi, seed.side)) % _TWO_PI
+    """Where the seed's ideal new partner NATURALLY points: exactly
+    opposite the seed, i.e. where its lost partner pointed. The matched
+    hemisphere is used as recorded - nothing is reflected or rotated."""
+    return (directed_phi(seed.thrust_phi, seed.side) + _PI) % _TWO_PI
 
 
 def _direction_delta(a, b):
@@ -239,12 +235,12 @@ class HemisphereLibrary:
         within that fraction of the seed's pT (|pT_c - pT_s| <= tol * pT_s,
         default 10%) are considered; pass ``None`` to disable the window.
         Among those, the match minimizes the Euclidean distance in two
-        coordinates: candidate directed phi vs ``query_direction(seed)``, and
-        candidate eta vs seed PARTNER eta (the returned hemisphere sits where
-        the seed's discarded partner was - preserving the event's
-        longitudinal boost). The directed-phi coordinate builds the correct
-        side into the match: reflecting the returned hemisphere's jets
-        phi -> -phi puts it opposite the seed, so no rotation is ever needed.
+        coordinates: candidate directed phi vs ``query_direction(seed)``
+        (the direction exactly opposite the seed), and candidate eta vs seed
+        PARTNER eta (the returned hemisphere sits where the seed's discarded
+        partner was - preserving the event's longitudinal boost). The match
+        must NATURALLY point back at the seed: its jets are used exactly as
+        recorded, with no reflection, rotation or any other modification.
         ``seed`` is a ``Hemisphere`` (its ``pt``, ``thrust_phi``, ``side``
         and ``partner_eta`` are used).
 

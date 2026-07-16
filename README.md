@@ -17,13 +17,16 @@ arXiv:1712.02538 / arXiv:2403.20241 for the method.
 
 - **Steps 1–2** (`run3-mj-mixer`, `mix.py`): per-event split + hemisphere
   characterization — slimmed 5-jet events → `mixed_*.root`.
-- **Step 3** (`library.py`): `HemisphereLibrary` — 4-coordinate
-  nearest-neighbor matching (pT/pT_max, directed φ, cross-matched η pair),
-  usage budgets from stochastic weight rounding, symmetric pair blacklist.
+- **Step 3** (`library.py`): `HemisphereLibrary` — a hard pT-balance window
+  (candidate within 10% of the seed's pT) + nearest-neighbor matching in
+  (directed φ, partner η); the query is the direction *opposite* the seed, so
+  the match must **naturally** point back at it. Usage budgets from stochastic
+  weight rounding, symmetric pair blacklist.
 - **Step 4** (`run3-mj-stitch`, `stitch.py`): production 5→6 stitching —
-  random draws + matching + φ→−φ reflection (the only transform; hemispheres
-  are never rotated) → weight-1 six-jet pseudo-events, evaluator-compatible
-  output with `match_distance` and parent provenance.
+  random draws + matching → weight-1 six-jet pseudo-events. **No transform of
+  any kind**: jet four-vectors are never modified (no rotations, reflections
+  or mirroring — φ is detector-physical). Evaluator-compatible output with
+  `match_distance` and parent provenance.
 
 For every event in a slimmed file with **exactly `n_jets` jets** (config,
 default 5 — others are dropped), `mix.py`:

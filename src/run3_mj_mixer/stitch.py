@@ -12,9 +12,11 @@ weight; RNG seeded by --seed, default 42), then repeatedly:
      exhausted hemispheres; a returned partner costs budget - 1,
   3. if no candidate passes the pT window, or the best one is farther than
      --max-distance, the seed is retired (no output event; a deterministic
-     search would only fail again), otherwise the partner's jets are
-     reflected phi -> -phi (the ONLY transform - phi is physical) and the
-     two 3-jet hemispheres become one 6-jet pseudo-event,
+     search would only fail again), otherwise the two 3-jet hemispheres
+     become one 6-jet pseudo-event. The matched hemisphere NATURALLY points
+     opposite the seed (that is what the directed-phi query selects): every
+     jet four-vector is copied through exactly as recorded, with no
+     reflection, rotation or any other transform,
 
 until no budget is left anywhere. All pseudo-events carry weight 1.
 
@@ -137,11 +139,11 @@ def stitch_all(lib, max_distance, pt_tolerance):
             n_fail += 1
         else:
             n_fill += 1
-            # The one allowed transform: undo the query reflection.
-            p_phi = (-match.jet_phi + math.pi) % (2.0 * math.pi) - math.pi
+            # No transform of any kind: the match already points opposite
+            # the seed, and every four-vector is copied through unmodified.
             jets_pt.append(np.concatenate([seed.jet_pt, match.jet_pt]))
             jets_eta.append(np.concatenate([seed.jet_eta, match.jet_eta]))
-            jets_phi.append(np.concatenate([seed.jet_phi, p_phi]))
+            jets_phi.append(np.concatenate([seed.jet_phi, match.jet_phi]))
             jets_m.append(np.concatenate([seed.jet_mass, match.jet_mass]))
             jets_hemi.append(np.array([0, 0, 0, 1, 1, 1], dtype=np.int32))
             distance.append(dist)

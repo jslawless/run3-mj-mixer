@@ -1,7 +1,7 @@
 from importlib.metadata import version, PackageNotFoundError
 
 from run3_mj_mixer.library import (
-    Hemisphere, HemisphereLibrary, directed_phi, query_direction, reflect_phi,
+    Hemisphere, HemisphereLibrary, directed_phi, query_direction,
 )
 
 try:
@@ -10,4 +10,4 @@ except PackageNotFoundError:
     __version__ = "unknown"
 
 __all__ = ["Hemisphere", "HemisphereLibrary", "directed_phi",
-           "query_direction", "reflect_phi"]
+           "query_direction"]
