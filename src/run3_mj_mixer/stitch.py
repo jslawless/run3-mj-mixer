@@ -6,14 +6,15 @@ Loads every 3-jet hemisphere of the input ``mixed_*.root`` file(s) into a
 weight; RNG seeded by --seed, default 42), then repeatedly:
 
   1. draws a random still-available hemisphere (budget - 1),
-  2. finds its nearest partner in the 4-coordinate matching space, skipping
-     same-event and already-produced pairs (both directions) and exhausted
-     hemispheres; a returned partner costs budget - 1,
-  3. if the best candidate is farther than --max-distance the seed is
-     retired (no output event; a deterministic search would only fail
-     again), otherwise the partner's jets are reflected phi -> -phi (the
-     ONLY transform - phi is physical) and the two 3-jet hemispheres become
-     one 6-jet pseudo-event,
+  2. finds its nearest partner in the (directed phi, partner eta) plane
+     among candidates within --pt-tolerance (default 10%) of the seed's pT,
+     skipping same-event and already-produced pairs (both directions) and
+     exhausted hemispheres; a returned partner costs budget - 1,
+  3. if no candidate passes the pT window, or the best one is farther than
+     --max-distance, the seed is retired (no output event; a deterministic
+     search would only fail again), otherwise the partner's jets are
+     reflected phi -> -phi (the ONLY transform - phi is physical) and the
+     two 3-jet hemispheres become one 6-jet pseudo-event,
 
 until no budget is left anywhere. All pseudo-events carry weight 1.
 
@@ -109,7 +110,7 @@ def load_library(paths, tree_name, lib):
     return n_events
 
 
-def stitch_all(lib, max_distance):
+def stitch_all(lib, max_distance, pt_tolerance):
     """Draw / match / stitch until the library is exhausted.
 
     Returns (records, counters): ``records`` holds the per-pseudo-event jet
@@ -129,7 +130,8 @@ def stitch_all(lib, max_distance):
         n_draw += 1
         match, dist = lib.findPartnerHemisphere(
             seed, exclude_event_id=seed.event_id,
-            max_distance=max_distance, with_distance=True,
+            max_distance=max_distance, pt_tolerance=pt_tolerance,
+            with_distance=True,
         )
         if match is None:
             n_fail += 1
@@ -224,7 +226,11 @@ def main():
     parser.add_argument("--tree", default="events", help="input tree name")
     parser.add_argument("--max-distance", type=float, default=0.5,
                         help="reject matches farther than this in the "
-                        "4-coordinate space (the seed is retired)")
+                        "(directed phi, partner eta) plane (the seed is "
+                        "retired)")
+    parser.add_argument("--pt-tolerance", type=float, default=0.10,
+                        help="hard pT-balance window: candidates must have "
+                        "pT within this fraction of the seed's pT")
     parser.add_argument("--seed", type=int, default=42,
                         help="RNG seed for budgets and random draws")
     parser.add_argument("--chunk-size", type=int, default=100_000,
@@ -239,10 +245,10 @@ def main():
     if len(lib) == 0:
         sys.exit("No 3-jet hemispheres found - nothing to stitch.")
 
-    records, counters = stitch_all(lib, args.max_distance)
+    records, counters = stitch_all(lib, args.max_distance, args.pt_tolerance)
     print(f"draws: {counters['draws']:,} | pseudo-events: "
-          f"{counters['filled']:,} | failed (d > {args.max_distance:g}): "
-          f"{counters['failed']:,}")
+          f"{counters['filled']:,} | failed (pT window {args.pt_tolerance:g} "
+          f"or d > {args.max_distance:g}): {counters['failed']:,}")
     if counters["filled"] == 0:
         sys.exit("No pseudo-events produced (max-distance too tight?).")
 
@@ -275,11 +281,13 @@ def main():
         f["version"] = version_hist
         f.mktree("meta", {"rng_seed": np.dtype(np.int64),
                           "max_distance": np.dtype(np.float64),
+                          "pt_tolerance": np.dtype(np.float64),
                           "n_hemispheres": np.dtype(np.int64),
                           "budget0": np.dtype(np.int64)})
         f["meta"].extend({
             "rng_seed": np.array([args.seed], dtype=np.int64),
             "max_distance": np.array([args.max_distance], dtype=np.float64),
+            "pt_tolerance": np.array([args.pt_tolerance], dtype=np.float64),
             "n_hemispheres": np.array([len(lib)], dtype=np.int64),
             "budget0": np.array([counters["budget0"]], dtype=np.int64),
         })

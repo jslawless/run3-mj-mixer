@@ -26,7 +26,9 @@ for i in "${filesets[@]}"; do
     IFS='.' read -ra arrIN <<< "$filename"
 
     tag=${arrIN[0]}
-    python scripts/submit_mixer.py -i $i -o $3/$tag --config "$CONFIG" --wheel $2 --logdir ${tag}_log
+    # --no-stitch: this layout is one FILE per condor run, so an in-job stitch
+    # would see a degenerate single-file library. Stitch separately if needed.
+    python scripts/submit_mixer.py -i $i -o $3/$tag --config "$CONFIG" --wheel $2 --logdir ${tag}_log --no-stitch
     condor_submit ${tag}_log/submit.sub
     sleep 2
 done

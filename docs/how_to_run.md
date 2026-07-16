@@ -43,7 +43,7 @@ smallest slice runs out, the leftover files go to a `mixing_jobs_unused.json`
 sidecar — bookkeeping only, they are not submitted (they can't form
 slice-balanced jobs). The summary prints the files-per-job for the `-n` below.
 
-## 5. Submit
+## 5. Submit (mix + stitch in one condor run)
 ```
 python scripts/submit_mixer.py -i mixing_jobs.json -o /store/user/<you>/mixed \
     --config config/config.json --wheel run3_mj_mixer-1.0.0-py3-none-any.whl \
@@ -54,18 +54,76 @@ python scripts/submit_mixer.py -i mixing_jobs.json -o /store/user/<you>/mixed \
 bare `/store/...` path; the job adds the `root://cmseos.fnal.gov/` redirector
 automatically.
 
+**Stitching runs inside the job by default**: after mixing its files, each job
+runs `run3-mj-stitch` over its own `mixed_*.root` (the job group is a complete
+slice-balanced library by construction) and delivers BOTH the mixed files and
+`stitched_job_<k>.root` to EOS. The stitch parameters pass through:
+`--max-distance` (0.5), `--pt-tolerance` (0.10), `--seed` (42). Pass
+`--no-stitch` to skip. A stitch failure never discards the mixed outputs —
+they are delivered anyway and the job exits nonzero so condor flags it.
+The submitter warns if `-n` splits a job group across condor runs (each run
+would stitch only a partial library).
+
 Cross-section weighting is on by default: `submit_mixer.py` transfers
 `run3-mj-pass-the-aux/mj_samples_xs.json` (the sibling aux repo) into each job,
 and the mixer weights every hemisphere by `lumi * xs_pb / n_original`
 (inferring the HT slice from each file's name). Pass `--xs-json` to point
-elsewhere.
+elsewhere. The stitched statistics are set by these weights (usage budgets =
+stochastic rounding), so normalization choices belong to THIS step.
 
 (`scripts/run_all.sh <filelists-dir-or-json> <wheel> <eos-outdir> [config]`
 still works for the one-dataset-per-job layout — it submits each fileset with
-the default `-n 1`.)
+the default `-n 1` and `--no-stitch`, since a single-file library is not
+meaningful.)
 
 ## Run one file locally (no condor)
 ```
 run3-mj-mixer /path/to/slimmed_X.root config/config.json
 # -> ./mixed_slimmed_X.root
 ```
+
+## 6. Re-stitching from EOS (parameter scans)
+
+The mixed files on EOS are the cheap re-run checkpoint: retuning
+`--max-distance` / `--pt-tolerance` / `--seed` only needs stitching, not
+re-mixing. From the LPC login node, set up an env that sees the LCG view's
+uproot/awkward and the wheel (the same trick the condor jobs use):
+
+```
+source /cvmfs/sft.cern.ch/lcg/views/LCG_106/x86_64-el9-gcc13-opt/setup.sh
+python -m venv --system-site-packages stitch-env
+source stitch-env/bin/activate
+pip install --no-deps run3_mj_mixer-1.0.0-py3-none-any.whl
+```
+
+uproot in the LCG view reads `root://` URLs directly, so no local copies are
+needed — build each job's URL list with `xrdfs ls` (note: `xrdcp` does NOT glob
+remote paths):
+
+```
+HOST=root://cmseos.fnal.gov
+MIXED=/store/user/<you>/mixed
+OUT=/store/user/<you>/stitched
+for k in $(seq 1 <NJOBS>); do
+    FILES=$(xrdfs ${HOST#root://} ls $MIXED | grep "mixed_job_${k}_" \
+            | sed "s|^|$HOST/|")
+    run3-mj-stitch $FILES -o stitched_job_${k}.root \
+        --max-distance 0.5 --pt-tolerance 0.10 --seed 42
+    xrdcp -f stitched_job_${k}.root $HOST/$OUT/ && rm stitched_job_${k}.root
+done
+```
+
+Each run prints `draws / pseudo-events / failed`; per-event provenance,
+`match_distance`, `stitch_cutflow` and a `meta` tree (seed, max_distance,
+pt_tolerance) are in the output for QA. The stitched files are
+evaluator-compatible and go straight into the evaluator.
+
+Notes:
+- **Statistics** come from the usage budgets = stochastic rounding of the
+  hemisphere weights baked in at mix time (`lumi * xs_pb / n_original`, with
+  lumi = 1.0 and per-file n_original under the condor flow). The total budget
+  printed at stitch start bounds the pseudo-event yield (~budget/2 minus
+  failed seeds).
+- `--max-distance` was tuned for the old 4-coordinate metric; with the
+  (directed phi, partner eta) plane + hard pT window it is effectively looser
+  and may deserve a retune.

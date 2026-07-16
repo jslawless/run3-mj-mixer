@@ -2,12 +2,13 @@
 
 Step 3 of the hemisphere-mixing method: collect the hemispheres of many
 5-jet events into a ``HemisphereLibrary``, then, for a seed hemisphere, find
-the library hemisphere that best "continues" its event. The matching axes are
-the three we settled on:
+the library hemisphere that best "continues" its event. Matching is a hard
+pT-balance requirement plus a nearest-neighbor search in two coordinates:
 
-  * hemisphere pT   - the summed transverse momentum, normalized by the
-                      largest hemisphere pT in the library (encodes the
-                      pT-balance condition);
+  * hemisphere pT   - a REQUIREMENT, not a distance term: only candidates
+                      whose summed transverse momentum lies within
+                      ``pt_tolerance`` (default 10%) of the seed's pT are
+                      considered at all (the pT-balance condition);
   * directed phi    - the thrust-axis angle SIGNED by which end of the axis
                       the hemisphere points along (axis phi for the +n_T
                       side, phi + pi for the -n_T side; 2pi-periodic). The
@@ -16,17 +17,14 @@ the three we settled on:
                       lands the match opposite the seed - with the correct
                       side built into the coordinate, no rotation is ever
                       applied (phi is physical in the detector);
-  * eta, CROSS-matched (two coordinates) - the candidate's OWN eta must sit
-                      where the seed's discarded partner was
-                      (candidate.eta ~ seed.partner_eta), so the pseudo-event
-                      keeps the seed event's longitudinal boost; and the
-                      candidate's partner eta must sit where the seed is
-                      (candidate.partner_eta ~ seed.eta), so the seed is a
-                      drop-in replacement for the candidate's lost partner.
+  * partner eta     - the candidate's OWN eta must sit where the seed's
+                      discarded partner was (candidate.eta ~
+                      seed.partner_eta), so the pseudo-event keeps the seed
+                      event's longitudinal boost.
 
-"Closest" is the Euclidean distance in these four coordinates. pT enters
-normalized to [0, 1]; the etas are used raw; the phi difference is folded
-on the 2pi period of the directed angle.
+"Closest" is the Euclidean distance in the (directed phi, partner eta)
+plane. The eta is used raw; the phi difference is folded on the 2pi period
+of the directed angle.
 
 This module is deliberately standalone (numpy only) so the analyzer can
 ``from run3_mj_mixer.library import HemisphereLibrary`` without pulling in
@@ -103,9 +101,9 @@ class HemisphereLibrary:
     """All hemispheres handed to it, searchable by nearest-neighbor matching.
 
     ``addHemisphere`` stores a hemisphere; ``findPartnerHemisphere`` returns
-    the stored hemisphere closest to a seed in the 4-coordinate matching
-    space; ``returnRandomHemisphere`` draws a random still-available
-    hemisphere to seed a pseudo-event.
+    the stored hemisphere within the pT window that is closest to a seed in
+    the (directed phi, partner eta) plane; ``returnRandomHemisphere`` draws
+    a random still-available hemisphere to seed a pseudo-event.
 
     Usage budgets: every hemisphere gets an integer budget from its event
     weight by stochastic rounding, floor(w) + Bernoulli(frac(w)), with the
@@ -121,7 +119,6 @@ class HemisphereLibrary:
         self._pt = []
         self._dir_phi = []  # directed_phi(thrust_phi, side) per hemisphere
         self._eta = []
-        self._partner_eta = []
         self._pt_max = 0.0  # largest hemisphere pT seen: the pT normalization
         self._rng = np.random.default_rng(seed)
         self._budget = []        # remaining uses per hemisphere
@@ -217,7 +214,6 @@ class HemisphereLibrary:
         self._pt.append(hemi.pt)
         self._dir_phi.append(directed_phi(hemi.thrust_phi, hemi.side))
         self._eta.append(hemi.eta)
-        self._partner_eta.append(hemi.partner_eta)
         self._pt_max = max(self._pt_max, hemi.pt)
         # Usage budget: stochastic rounding of the event weight.
         frac = hemi.weight - math.floor(hemi.weight)
@@ -234,21 +230,23 @@ class HemisphereLibrary:
         return hemi
 
     def findPartnerHemisphere(self, seed, exclude_event_id=None,
-                              max_distance=None, record=True,
-                              with_distance=False, progress=False,
-                              chunk_size=100_000):
+                              max_distance=None, pt_tolerance=0.10,
+                              record=True, with_distance=False,
+                              progress=False, chunk_size=100_000):
         """The stored hemisphere closest to ``seed`` in the matching space.
 
-        Four coordinates: candidate pT vs seed pT (both / max pT); candidate
-        directed phi vs ``query_direction(seed)``; candidate eta vs seed
-        PARTNER eta and candidate partner eta vs seed eta (the cross-matched
-        pair: the returned hemisphere sits where the seed's discarded partner
-        was, and its own lost partner sat where the seed is - preserving the
-        event's longitudinal boost). The directed-phi coordinate builds the
-        correct side into the match: reflecting the returned hemisphere's
-        jets phi -> -phi puts it opposite the seed, so no rotation is ever
-        needed. ``seed`` is a ``Hemisphere`` (its ``pt``, ``thrust_phi``,
-        ``side``, ``eta`` and ``partner_eta`` are used).
+        ``pt_tolerance`` is a HARD requirement: only candidates whose pT lies
+        within that fraction of the seed's pT (|pT_c - pT_s| <= tol * pT_s,
+        default 10%) are considered; pass ``None`` to disable the window.
+        Among those, the match minimizes the Euclidean distance in two
+        coordinates: candidate directed phi vs ``query_direction(seed)``, and
+        candidate eta vs seed PARTNER eta (the returned hemisphere sits where
+        the seed's discarded partner was - preserving the event's
+        longitudinal boost). The directed-phi coordinate builds the correct
+        side into the match: reflecting the returned hemisphere's jets
+        phi -> -phi puts it opposite the seed, so no rotation is ever needed.
+        ``seed`` is a ``Hemisphere`` (its ``pt``, ``thrust_phi``, ``side``
+        and ``partner_eta`` are used).
 
         ``exclude_event_id`` skips stored hemispheres with that ``event_id``
         (pass the seed's own to forbid same-event pairing, seed itself
@@ -275,7 +273,7 @@ class HemisphereLibrary:
         ``progress=True`` shows a tqdm bar over the scan (``chunk_size``
         hemispheres per step; no-op if tqdm is unavailable).
         Raises ``ValueError`` if the library is empty, or fully excluded
-        when no ``max_distance`` is set.
+        (bookkeeping and pT window combined) when no ``max_distance`` is set.
         """
         n = len(self._hemispheres)
         if n == 0:
@@ -284,11 +282,11 @@ class HemisphereLibrary:
         pt = np.asarray(self._pt)
         dir_phi = np.asarray(self._dir_phi)
         eta = np.asarray(self._eta)
-        partner_eta = np.asarray(self._partner_eta)
-        norm = self._pt_max if self._pt_max > 0.0 else 1.0
         query_phi = query_direction(seed)
 
         excluded = np.zeros(n, dtype=bool)
+        if pt_tolerance is not None:  # the hard pT-balance window
+            excluded |= np.abs(pt - seed.pt) > pt_tolerance * seed.pt
         if exclude_event_id is not None:
             excluded |= np.fromiter(
                 (h.event_id == exclude_event_id for h in self._hemispheres),
@@ -312,10 +310,8 @@ class HemisphereLibrary:
         for lo in range(0, n, chunk_size):
             hi = min(lo + chunk_size, n)
             d2 = (
-                ((pt[lo:hi] - seed.pt) / norm) ** 2
-                + _direction_delta(dir_phi[lo:hi], query_phi) ** 2
+                _direction_delta(dir_phi[lo:hi], query_phi) ** 2
                 + (eta[lo:hi] - seed.partner_eta) ** 2
-                + (partner_eta[lo:hi] - seed.eta) ** 2
             )
             d2[excluded[lo:hi]] = np.inf
             k = int(np.argmin(d2))
@@ -335,7 +331,8 @@ class HemisphereLibrary:
             if max_distance is None:
                 raise ValueError(
                     "Every hemisphere in the library is excluded "
-                    f"(event_id={exclude_event_id!r}, prior matches for this "
+                    f"(pT window: {pt_tolerance!r}, "
+                    f"event_id={exclude_event_id!r}, prior matches for this "
                     f"seed: {len(prior) if prior else 0})."
                 )
             if record:

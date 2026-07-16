@@ -5,6 +5,16 @@ Reads a coffea-style fileset JSON of SLIMMED files (the output of run3-mj-slimme
 splits files into per-job groups, and writes condor submission files. Each job
 installs run3-mj-mixer from a pre-built wheel and runs it on its assigned files.
 
+By default each job also STITCHES its own mixed outputs into 6-jet pseudo-events
+(run3-mj-stitch over the job's mixed_*.root; --max-distance / --pt-tolerance /
+--seed are passed through) and delivers BOTH the mixed and the stitched file to
+EOS - the mixed files stay the cheap re-stitch checkpoint for parameter scans.
+Pass --no-stitch to skip (e.g. for the one-file-per-job run_all.sh layout, whose
+single-file libraries are not meaningful). A stitch failure never discards the
+mixed outputs: they are delivered anyway and the job exits nonzero afterwards.
+NOTE: stitching assumes one condor run = one slice-balanced job group, i.e.
+-n >= the files-per-job printed by make_mixing_jobs.py.
+
 Build the wheel before submitting:
     pip wheel /path/to/run3-mj-mixer -w .
 
@@ -135,6 +145,7 @@ echo
 set -e
 {RUN_COMMANDS}
 set +e
+{STITCH_COMMANDS}
 echo "what directory am I in?"
 pwd
 echo "List all root files = "
@@ -171,6 +182,8 @@ done
 
 echo
 echo "Ending job on " `date`
+# Nonzero if stitching failed (mixed outputs were still delivered above).
+exit ${STITCH_EXIT:-0}
 """
 
 
@@ -227,8 +240,33 @@ class Batch:
         self.wheel = args.wheel
         self.xs_json = args.xs_json
         self.default_tree = args.tree
+        self.stitch = not args.no_stitch
+        self.max_distance = args.max_distance
+        self.pt_tolerance = args.pt_tolerance
+        self.rng_seed = args.seed
         self._write_jobs()
         self._write_submit()
+
+    def _stitch_block(self, name):
+        """The in-job stitching commands (run OUTSIDE set -e: a stitch failure
+        must not discard the mixed outputs - they are delivered regardless and
+        the job exits with the stitch code at the very end)."""
+        if not self.stitch:
+            return ""
+        out = f"stitched_{name}.root"
+        return "\n".join([
+            "# Stitch this job's library into pseudo-events (method step 4).",
+            f"run3-mj-stitch mixed_*.root -o {out}"
+            f" --max-distance {self.max_distance:g}"
+            f" --pt-tolerance {self.pt_tolerance:g}"
+            f" --seed {self.rng_seed}",
+            "STITCH_EXIT=$?",
+            "if [[ $STITCH_EXIT -ne 0 ]]; then",
+            "  echo \"ERROR: stitching failed (exit $STITCH_EXIT); "
+            "delivering mixed outputs anyway.\" >&2",
+            f"  rm -f {out}",
+            "fi",
+        ])
 
     def _write_jobs(self):
         wheel_basename = os.path.basename(self.wheel)
@@ -251,6 +289,7 @@ class Batch:
                 exe = EXECUTABLE_TEMPLATE.format(
                     WHEEL=wheel_basename,
                     RUN_COMMANDS="\n".join(run_cmds),
+                    STITCH_COMMANDS=self._stitch_block(name),
                     EOSOUTDIR=self.eosoutdir,
                 )
                 exe = exe + EXECUTABLE_TEMPLATE2
@@ -318,6 +357,18 @@ if __name__ == "__main__":
                              "weighting (default: the run3-mj-pass-the-aux sibling repo's "
                              "mj_samples_xs.json).")
     parser.add_argument("-n", "--nfPerJob", type=int, default=1, help="Files per job")
+    parser.add_argument("--no-stitch", action="store_true",
+                        help="Do NOT run run3-mj-stitch on the job's mixed outputs "
+                             "(stitching is on by default; use this for layouts where "
+                             "one condor run is not a full slice-balanced job group)")
+    parser.add_argument("--max-distance", type=float, default=0.5,
+                        help="run3-mj-stitch: reject matches farther than this in the "
+                             "(directed phi, partner eta) plane")
+    parser.add_argument("--pt-tolerance", type=float, default=0.10,
+                        help="run3-mj-stitch: hard pT-balance window as a fraction of "
+                             "the seed's pT")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="run3-mj-stitch: RNG seed for budgets and random draws")
     parser.add_argument("--tree",   default="events",   help="Fallback input tree name (overridden by fileset JSON; slimmed files use 'events')")
     parser.add_argument("--logdir", default="batch",    help="Directory for condor log/sh files")
     parser.add_argument("--cpu",    type=int, default=1, help="CPUs per job")
@@ -335,5 +386,14 @@ if __name__ == "__main__":
     args.eosoutdir = re.sub(r"^root://[^/]+/+", "/", args.eosoutdir)
 
     fileset = Fileset(args)
+
+    if not args.no_stitch:
+        split = [d for d, subjobs in fileset.jobs if len(subjobs) > 1]
+        if split:
+            print(f"  Warning: {len(split)} job group(s) are split across multiple "
+                  "condor runs (-n smaller than the group), so each run will stitch "
+                  "only its own PARTIAL library. Use -n >= the files-per-job printed "
+                  "by make_mixing_jobs.py, or pass --no-stitch.")
+
     batch = Batch(fileset.jobs, args)
     batch.submit(args.exec)
