@@ -4,7 +4,23 @@
     },
     "mixer": {
         "thrust_scan_points": 180,
-        "hist_bins":          90,
-        "n_jets":             5
+        "hist_bins": 90,
+        "n_jets": 5
+    },
+    "payload": {
+        "jet_branches": [
+            "pt",
+            "eta",
+            "phi",
+            "m",
+            "pt_jesUp",
+            "pt_jesDown",
+            "pt_jerUp",
+            "pt_jerDown",
+            "m_jesUp",
+            "m_jesDown",
+            "m_jerUp",
+            "m_jerDown"
+        ]
     }
 }

@@ -1,159 +1,302 @@
 # How to run on the LPC Condor cluster
 
-The mixer runs on **slimmed** files (the output of `run3-mj-slimmer`, tree
-`events`) and writes `mixed_*.root` files back to EOS, sorted into per-HT-slice
-subdirectories, with the stitched pseudo-events in a subdirectory of their own
-(see [step 5](#5-submit-mix--stitch-in-one-condor-run)).
+From a bare login node to checked pseudo-events. Assumes you already have a
+directory of slimmed files on EOS.
 
-## 1. Activate your voms proxy
-`voms-proxy-init --rfc --voms cms -valid 192:00`
-
-## 2. Build the project wheel
-`pip wheel . -w .`
-
-Each condor job `pip install`s this wheel with `--no-deps` into a venv that
-inherits the cvmfs LCG view's `uproot`/`awkward`/`numpy`/`boost-histogram`, so
-no large PyPI downloads happen on the worker node. The mixer needs no coffea or
-onnxruntime, so the job is light.
-
-## 3. Build filelists of the slimmed inputs
-Point `make_eos_filelists.py` at the slimmer's EOS output directory (the dir you
-passed as the slimmer's `-o/--eosoutdir`), whose subdirs are the per-dataset
-slimmed outputs:
+Three logical stages — **index**, **match**, **assemble** — the first and last
+split into a parallel half and a serial half:
 
 ```
-python scripts/make_eos_filelists.py \
-    --host cmseos.fnal.gov \
-    --base /store/user/<you>/slimmed \
-    -o filelists/
+slimmed ──1a──> index shards ──1b──> global index ──2──> pairs ──3a──> legs ──3b──> pseudo-events
+        (condor)             (login)              (login)      (condor)     (condor)
 ```
 
-This writes one `filelists/<dataset>.json` per dataset, each recording tree
-`events`. (`filelists/EXAMPLE_*.json` shows the schema; `filelists_local/` holds
-a local-file example for quick tests.)
+`-o` is the **same output parent for every condor stage**; each writes its own
+subdirectory (`index/`, `legs/`, `stitched/`).
 
-## 4. Group into mixed jobs
-Each condor run should span all QCD HT slices so the hemisphere library sees the
-full spectrum. Build the job-grouped fileset:
+Scripts are grouped by what they do: `scripts/submitters/` build filelists and
+submit condor jobs, `scripts/monitors/` inspect what came back,
+`scripts/event_displayers/` draw events.
 
-```
-python scripts/make_mixing_jobs.py filelists/ --only QCD -o mixing_jobs.json
-```
+---
 
-This makes `job_1`, `job_2`, ... (5 files/slice each by `--per-slice`). Once the
-smallest slice runs out, the leftover files go to a `mixing_jobs_unused.json`
-sidecar — bookkeeping only, they are not submitted (they can't form
-slice-balanced jobs). The summary prints the files-per-job for the `-n` below.
+## 1. Clone, side by side
 
-## 5. Submit (mix + stitch in one condor run)
-```
-python scripts/submit_mixer.py -i mixing_jobs.json -o /store/user/<you>/mixed \
-    --config config/config.json --wheel run3_mj_mixer-1.0.0-py3-none-any.whl \
-    -n <files_per_job>
+The mixer locates `mj_samples_xs.json` by walking up for a
+`run3-mj-pass-the-aux/` sibling, so the two repos must share a parent directory.
+
+```bash
+mkdir -p ~/nobackup/analysis && cd ~/nobackup/analysis
+git clone git@github.com:jslawless/run3-mj-mixer.git
+git clone git@github.com:jslawless/run3-mj-pass-the-aux.git
+cd run3-mj-mixer
 ```
 
-`-n <files_per_job>` makes each `job_k` a single condor run. `<eos-outdir>` is a
-bare `/store/...` path; the job adds the `root://cmseos.fnal.gov/` redirector
-automatically.
+## 2. Login-node environment
 
-The two kinds of output go to separate subdirectories of `<eos-outdir>`, and the
-hemisphere (mixed) files are split by HT slice — a job group spans every slice,
-so its mixed files do not belong together:
+Stages 1b, 2 and the QA run on the login node and need
+uproot/awkward/numpy/boost-histogram. Use the same LCG view the condor jobs use,
+and install this package with **`--no-deps`** — pulling PyPI wheels risks an
+ABI mismatch against the view's libstdc++.
 
-```
-/store/user/<you>/mixed/
-├── hemispheres/
-│   ├── QCD-4Jets_HT-400to600_TuneCP5_13p6TeV_madgraphMLM-pythia8/
-│   │   ├── mixed_job_1_slimmed_...root
-│   │   └── mixed_job_2_slimmed_...root
-│   └── QCD-4Jets_HT-600to800_TuneCP5_13p6TeV_madgraphMLM-pythia8/
-│       └── ...
-└── stitched/
-    ├── stitched_job_1.root
-    └── stitched_job_2.root
-```
-
-Each file's slice is read off its name using the cross-section JSON's dataset
-keys — the same rule the mixer uses to find that file's cross section, so a
-file's directory always matches the weight it was mixed with. The submitter
-prints the resulting layout (and warns about files it could not label, which
-land in `hemispheres/unknown_slice`) before you submit. Because the per-slice
-dirs are exactly the layout `make_eos_filelists.py` expects, `--base
-/store/user/<you>/mixed/hemispheres` turns the mixed output straight back into
-per-slice filelists.
-
-**Stitching runs inside the job by default**: after mixing its files, each job
-runs `run3-mj-stitch` over its own `hemispheres/*/mixed_*.root` (the job group is
-a complete slice-balanced library by construction) and delivers BOTH the mixed
-files and `stitched/stitched_job_<k>.root` to EOS. The stitch parameters pass
-through:
-`--max-distance` (0.5), `--pt-tolerance` (0.10), `--seed` (42). Pass
-`--no-stitch` to skip. A stitch failure never discards the mixed outputs —
-they are delivered anyway and the job exits nonzero so condor flags it.
-The submitter warns if `-n` splits a job group across condor runs (each run
-would stitch only a partial library).
-
-Cross-section weighting is on by default: `submit_mixer.py` transfers
-`run3-mj-pass-the-aux/mj_samples_xs.json` (the sibling aux repo) into each job,
-and the mixer weights every hemisphere by `lumi * xs_pb / n_original`
-(inferring the HT slice from each file's name). Pass `--xs-json` to point
-elsewhere. The stitched statistics are set by these weights (usage budgets =
-stochastic rounding), so normalization choices belong to THIS step.
-
-(`scripts/run_all.sh <filelists-dir-or-json> <wheel> <eos-outdir> [config]`
-still works for the one-dataset-per-job layout — it submits each fileset with
-the default `-n 1` and `--no-stitch`, since a single-file library is not
-meaningful.)
-
-## Run one file locally (no condor)
-```
-run3-mj-mixer /path/to/slimmed_X.root config/config.json
-# -> ./mixed_slimmed_X.root   (--outdir DIR writes it elsewhere, creating DIR)
-```
-
-## 6. Re-stitching from EOS (parameter scans)
-
-The mixed files on EOS are the cheap re-run checkpoint: retuning
-`--max-distance` / `--pt-tolerance` / `--seed` only needs stitching, not
-re-mixing. From the LPC login node, set up an env that sees the LCG view's
-uproot/awkward and the wheel (the same trick the condor jobs use):
-
-```
+```bash
 source /cvmfs/sft.cern.ch/lcg/views/LCG_106/x86_64-el9-gcc13-opt/setup.sh
-python -m venv --system-site-packages stitch-env
-source stitch-env/bin/activate
-pip install --no-deps run3_mj_mixer-1.0.0-py3-none-any.whl
+export LC_ALL=C.UTF-8 LANG=C.UTF-8 LC_CTYPE=C.UTF-8
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install --no-deps -e .
+python3 -c "import uproot; print('uproot', uproot.__version__)"
 ```
 
-uproot in the LCG view reads `root://` URLs directly, so no local copies are
-needed — build each job's URL list with `xrdfs ls` (note: `xrdcp` does NOT glob
-remote paths):
+## 3. Proxy and wheel
 
+```bash
+voms-proxy-init --rfc --voms cms -valid 192:00
+pip wheel . -w .
+export WHEEL=$PWD/$(ls run3_mj_mixer-*.whl | head -1)
+export OUT=/store/user/$USER/mixing
 ```
-HOST=root://cmseos.fnal.gov
-MIXED=/store/user/<you>/mixed/hemispheres
-OUT=/store/user/<you>/stitched
-for k in $(seq 1 <NJOBS>); do
-    # -R: the hemisphere files sit one level down, in per-slice subdirs.
-    FILES=$(xrdfs ${HOST#root://} ls -R $MIXED | grep "mixed_job_${k}_" \
-            | sed "s|^|$HOST/|")
-    run3-mj-stitch $FILES -o stitched_job_${k}.root \
-        --max-distance 0.5 --pt-tolerance 0.10 --seed 42
-    xrdcp -f stitched_job_${k}.root $HOST/$OUT/ && rm stitched_job_${k}.root
+
+**Rebuild the wheel after any source change** — condor installs from it, not from
+your checkout.
+
+## 4. List the slimmed inputs
+
+```bash
+python scripts/submitters/make_eos_filelists.py \
+    --host cmseos.fnal.gov \
+    --base /store/user/$USER/slimmed \
+    -o filelists/
+ls filelists/
+```
+
+One JSON per slice, holding full `root://cmseos.fnal.gov//store/...` URLs. Both
+the submitter and the file table read this directory directly.
+
+## 5. Stage 1a — index shards (condor)
+
+```bash
+python scripts/submitters/submit_index.py \
+    -i filelists/ -o $OUT \
+    --config config/config.json --wheel $WHEEL \
+    -n 20 --logdir batch_index --exec
+
+condor_q
+```
+
+Omit `--exec` the first time and read `batch_index/submit.sub` plus one `.sh`.
+
+Each job writes one shard per file to `$OUT/index/<slice>/hindex_*.root`, ~65
+bytes per hemisphere. It does **not** copy the event data — that stays in the
+slimmed files and is looked up in 3a. Files are grouped by slice for read
+locality; they no longer need to be representative samples, which was only
+required when each job built its own private library.
+
+A slimmed file that passes no events still yields a **0-row shard with a
+completion marker**, so a missing shard is unambiguously a failed job.
+
+## 6. Stage 1b — file table and global index (login node)
+
+```bash
+run3-mj-file-table --from-file filelists/ -o file_table.json --workers 8 --progress
+
+python scripts/submitters/make_index_filelists.py \
+    --host cmseos.fnal.gov --base $OUT/index -o shards.txt --url
+
+run3-mj-index-build --from-file shards.txt -t file_table.json \
+    -o global_index/ --progress
+```
+
+The file table maps `file_id` → path, dataset, weight. **This is where the
+normalization is fixed**: `w_rel = xs_pb / Σ cutflow[0]` over *every file of the
+slice*. The old mixer divided by one file's count, so two files of the same slice
+got different weights.
+
+Check the printed `w_rel` per slice, and note the `index_id` — it is stamped into
+every downstream file.
+
+For data: add `--mode data`, which sets `w_rel ≡ 1` and reads no cross-section
+JSON at all.
+
+> The file-table step opens every slimmed file to read one histogram. `--workers 8`
+> helps; expect minutes at full scale. A file with no `cutflow` fails the step
+> loudly rather than under-counting the denominator — deliberate, but it means one
+> bad slimmed file blocks you until it is re-slimmed.
+
+## 7. Stage 2 — match (login node)
+
+```bash
+run3-mj-match global_index/ -t file_table.json -o pairs/ \
+    --max-distance 0.5 --pt-tolerance 0.10 --seed 42 \
+    --pairs-per-chunk 100000 --progress
+```
+
+Reads **only the index**, never event data. Draws hemispheres uniformly at
+random, finds each one's partner, streams `pairs/pairs_*.root`.
+
+**Single use**: a draw consumes the seed and a match consumes the partner, so
+each hemisphere appears in at most one pair and each source event in at most one
+pseudo-event.
+
+Read the printed reason breakdown before continuing:
+
+| reason | meaning | what helps |
+|---|---|---|
+| `WINDOW_EMPTY` | nothing in the sample has a compatible pT | more MC |
+| `ALL_CONSUMED` | the window's candidates were all used | draw order |
+| `TOO_FAR_DEPLETED` | a full pool *would* have matched it | draw order |
+| `TOO_FAR_INTRINSIC` | nothing near it even in a full pool | geometry / cut |
+
+`DEPLETED` vs `INTRINSIC` is the depletion measurement. Note depletion surfaces
+as `TOO_FAR`, **not** `ALL_CONSUMED`: late in the run the pT window still holds
+candidates, they are just further away.
+
+## 8. Copy the pairs to EOS
+
+Stage 2 runs on the login node, but stages 3a/3b are condor jobs that cannot read
+your scratch directory.
+
+```bash
+xrdfs cmseos.fnal.gov mkdir -p $OUT/pairs
+for f in pairs/*.root; do
+  xrdcp -f "$f" "root://cmseos.fnal.gov/$OUT/pairs/$(basename $f)"
+done
+xrdfs cmseos.fnal.gov ls $OUT/pairs | head
+```
+
+Keep the local `pairs/pairs_manifest.json` — stage 3b reads it with `--manifest`.
+
+## 9. Stage 3a — gather (condor)
+
+```bash
+export NP=60
+python scripts/submitters/submit_gather.py \
+    -p root://cmseos.fnal.gov/$OUT/pairs \
+    -t file_table.json -o $OUT \
+    --config config/config.json --wheel $WHEEL \
+    -P $NP --logdir batch_gather --exec
+```
+
+**Jobs own files, not pairs.** Each reads its slimmed files once, sequentially,
+and emits the payload for every hemisphere any pair references. Walking the pair
+list would re-open every file once per job — a jet branch is one basket per file,
+so there is no cheaper granularity — and that cost scales as `n_jobs × n_files`.
+
+**Check `payload.jet_branches` in `config/config.json` against your slimmer
+vintage first.** Older slimmed output lacks the JES/JER variations; gather
+refuses up front, naming every missing branch, rather than failing mid-job.
+
+## 10. Stage 3b — assemble (condor)
+
+```bash
+python scripts/submitters/submit_assemble.py \
+    -p root://cmseos.fnal.gov/$OUT/pairs \
+    -l root://cmseos.fnal.gov/$OUT/legs \
+    -t file_table.json -o $OUT \
+    --config config/config.json --wheel $WHEEL \
+    --manifest pairs/pairs_manifest.json \
+    -P $NP --logdir batch_assemble --exec
+```
+
+One job per pair chunk: read the chunk plus its leg shards, join on
+`(pair_id, leg)`, write `$OUT/stitched/stitched_*.root`.
+
+The join is **exact** — a missing leg aborts the job naming the pair rather than
+writing a short file, because a silently dropped pseudo-event is invisible
+downstream.
+
+`xs_weight` is the **product** of both parents' weights. That is pb²/event², not
+a cross section: the sample needs a global rescale, and the sums to derive it are
+in the pair manifest and each output's `sum_xs_weight`.
+
+## 11. Find and resubmit gaps
+
+```bash
+python scripts/monitors/check_stage_outputs.py legs \
+    -p pairs/ -d /eos/uscms$OUT/legs -P $NP
+python scripts/monitors/check_stage_outputs.py stitched \
+    -p pairs/ -d /eos/uscms$OUT/stitched
+```
+
+The ledger is each output file's own metadata — no database. Gaps print as a
+paste-ready `queue name from` block; drop it into the relevant
+`batch_*/submit.sub` and resubmit. Every stage is idempotent: names are
+deterministic, so a resubmit overwrites via `xrdcp -f`.
+
+## 12. QA
+
+```bash
+run3-mj-mixqa all \
+    -i global_index/ -t file_table.json \
+    -p pairs/ -l /eos/uscms$OUT/legs \
+    -s /eos/uscms$OUT/stitched/stitched_*.root \
+    --shards $(cat shards.txt) \
+    --config config/config.json
+echo "exit: $?"
+```
+
+Non-zero exit means an invariant failed. `spot` is the check that closes the loop
+back to the source: it re-reads slimmed files and verifies `jet_mask` really
+selects the jets the index claims — which is what licenses 3a to trust it.
+
+The `unmatched` section is a report, not pass/fail: the reason breakdown, the
+failure rate by quartile of the run (end-loaded means depletion), and
+matched-vs-unmatched kinematics.
+
+## 13. Clean up the intermediate
+
+Once 3b verifies, the legs are throwaway — `P × Q` small files:
+
+```bash
+xrdfs cmseos.fnal.gov rm -r $OUT/legs
+```
+
+---
+
+## Parameter scans
+
+Re-run **stage 2 only**. It reads a ~1 GB memory-mapped index, not tens of GB of
+ROOT, so there is no re-index and no ROOT re-read:
+
+```bash
+for MD in 0.3 0.5 0.7; do
+  run3-mj-match global_index/ -t file_table.json -o scan_md${MD}/ --max-distance $MD
+  run3-mj-mixqa pairs -p scan_md${MD}/ -t file_table.json
 done
 ```
 
-Each run prints `draws / pseudo-events / failed`; per-event provenance,
-`match_distance`, `stitch_cutflow` and a `meta` tree (seed, max_distance,
-pt_tolerance) are in the output for QA. The stitched files are
-evaluator-compatible and go straight into the evaluator.
+The match-distance distribution and the `unmatched` reason breakdown tell you
+whether a cut change is buying real matches or just admitting bad ones.
 
-Notes:
-- **Statistics** come from the usage budgets = stochastic rounding of the
-  hemisphere weights baked in at mix time (`lumi * xs_pb / n_original`, with
-  lumi = 1.0 and per-file n_original under the condor flow). The total budget
-  printed at stitch start bounds the pseudo-event yield (~budget/2 minus
-  failed seeds).
-- `--max-distance` was tuned for the old 4-coordinate metric; with the
-  (directed phi, partner eta) plane + hard pT window it is effectively looser
-  and may deserve a retune.
+## Local smoke test
+
+```bash
+export PYTHONPATH=$PWD/src
+run3-mj-index <slimmed>.root config/config.json --outdir /tmp/shards
+run3-mj-file-table <slimmed>.root -o /tmp/file_table.json
+run3-mj-index-build /tmp/shards/*.root -t /tmp/file_table.json -o /tmp/gi
+run3-mj-match /tmp/gi -t /tmp/file_table.json -o /tmp/pairs
+run3-mj-gather /tmp/pairs -t /tmp/file_table.json -o /tmp/legs --job 0 --n-jobs 1
+run3-mj-assemble /tmp/pairs/pairs_00000.root /tmp/legs/*.root \
+    -t /tmp/file_table.json -o /tmp/stitched.root
+run3-mj-mixqa all -i /tmp/gi -t /tmp/file_table.json -p /tmp/pairs \
+    -l /tmp/legs -s /tmp/stitched.root
+```
+
+## Merging for the analyzer
+
+Follow `run3-mj-analyzer/scripts/hadd_datasets.py`: hadd to a **local temp**,
+then `xrdcp`. Never hadd directly to EOS.
+
+## Notes
+
+- **The slimmed files are a production dependency**, because 3a reads them for
+  every payload branch. Retain them as long as you might add a systematic — but
+  they are kept anyway, which is why this beats depending on a large intermediate.
+- **`--max-distance 0.5` was tuned for an older 4-coordinate metric.** The retune
+  inputs are the match-distance distribution *and* the `unmatched` breakdown: a
+  pile-up just past the cut means real matches are being discarded, whereas
+  `TOO_FAR_INTRINSIC` means nothing was nearby at any radius.
+- **Data has no HT slices**, so every data file currently lands in one
+  `unknown_slice` bucket. Weighting does not care (`w_rel ≡ 1`) but output
+  organisation does; run era is the natural key and is not implemented yet.

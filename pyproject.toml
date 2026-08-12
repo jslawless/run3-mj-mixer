@@ -20,8 +20,17 @@ dependencies = [
 test = ["pytest>=7"]
 
 [project.scripts]
-run3-mj-mixer = "run3_mj_mixer.mix:main"
-run3-mj-stitch = "run3_mj_mixer.stitch:main"
+# index -> match -> assemble, with QA alongside. No new runtime dependencies:
+# the list above is still uproot/awkward/numpy/boost-histogram/fsspec_xrootd,
+# which is what lets the condor jobs inherit the LCG view's packages and install
+# this wheel with --no-deps.
+run3-mj-index = "run3_mj_mixer.shard:main"
+run3-mj-file-table = "run3_mj_mixer.filetable:main"
+run3-mj-index-build = "run3_mj_mixer.index_build:main"
+run3-mj-match = "run3_mj_mixer.match:main"
+run3-mj-gather = "run3_mj_mixer.gather:main"
+run3-mj-assemble = "run3_mj_mixer.assemble:main"
+run3-mj-mixqa = "run3_mj_mixer.qa:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
