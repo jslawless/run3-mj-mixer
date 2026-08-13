@@ -227,6 +227,19 @@ class Grid:
             s = np.floor(np.log(np.maximum(pt, 1e-9) / self.pt_min) / self.log_step)
         return np.maximum(s, 0).astype(np.int64)
 
+    # Scalar twins of the three cell lookups. The array forms are used once at
+    # build time; the query path calls them per seed, where wrapping a float in
+    # np.array([x]) and unwrapping the result costs more than the arithmetic.
+    def _slab_of1(self, pt):
+        return max(int(math.floor(math.log(max(pt, 1e-9) / self.pt_min)
+                                  / self.log_step)), 0)
+
+    def _phi_cell1(self, phi):
+        return int(math.floor((phi % _TWO_PI) / self.phi_w)) % self.n_phi
+
+    def _eta_cell1(self, eta):
+        return int(math.floor((eta - self.eta_lo) / self.cell_w))
+
     def _phi_cell(self, phi):
         return (np.floor((np.asarray(phi) % _TWO_PI) / self.phi_w)
                 .astype(np.int64) % self.n_phi)
@@ -247,9 +260,8 @@ class Grid:
         for candidates the exact pT cut then throws away.
         """
         lo, hi = self.window_bounds(pt_seed)
-        s0 = int(self._slab_of(np.array([max(lo, 1e-9)]))[0])
-        s1 = int(self._slab_of(np.array([max(hi, 1e-9)]))[0])
-        return max(s0, 0), min(s1, self.n_slab - 1)
+        return (max(self._slab_of1(lo), 0),
+                min(self._slab_of1(hi), self.n_slab - 1))
 
     def ring(self, s0, s1, phi_c, eta_c, r):
         """Rows in the cells at Chebyshev distance exactly ``r`` from the query."""
@@ -325,16 +337,46 @@ class Matcher:
         self._avail_pos = list(range(self.n))
         self.draw_index = 0
 
+        # Availability summed over fixed blocks of the pT-sorted order, so
+        # "how many available rows are in this pT window" costs O(window/BLOCK)
+        # instead of gathering the whole window. That gather ran on every
+        # failure and, once failures dominate the endgame, cost ~20x a
+        # successful query - the diagnostic, not the search, was the slowdown.
+        # per-sample counters for the rate log; reset each time it is written
+        self._stat_rings = 0
+
+        self._rank = np.empty(self.n, dtype=np.int64)
+        self._rank[self.grid.pt_order] = np.arange(self.n)
+        self._nblk = (self.n + self.BLOCK - 1) // self.BLOCK
+        self._blk_avail = np.full(self._nblk, self.BLOCK, dtype=np.int32)
+        if self.n:
+            self._blk_avail[-1] = self.n - self.BLOCK * (self._nblk - 1)
+
+        # The other hemisphere of the same event, or -1. Used to subtract
+        # same-event rows from a window population exactly.
+        self.sibling = np.full(self.n, -1, dtype=np.int64)
+        if self.n:
+            o = np.argsort(self.event_key, kind="stable")
+            k = self.event_key[o]
+            same = np.flatnonzero(k[:-1] == k[1:])
+            self.sibling[o[same]] = o[same + 1]
+            self.sibling[o[same + 1]] = o[same]
+
     # -- pool ---------------------------------------------------------------
 
     @property
     def n_available(self):
         return len(self._avail)
 
+    #: Rows per availability block. Large enough that the per-window block sum
+    #: is short, small enough that the two partial ends stay cheap.
+    BLOCK = 1024
+
     def _consume(self, i):
         if not self.available[i]:
             return
         self.available[i] = False
+        self._blk_avail[self._rank[i] // self.BLOCK] -= 1
         pos = self._avail_pos[i]
         last = self._avail[-1]
         self._avail[pos] = last
@@ -359,11 +401,20 @@ class Matcher:
         return (self.dir_phi[i] + np.pi) % _TWO_PI
 
     def distances(self, cand, query_phi, target_eta):
-        """The exact library.py metric, never the grid's approximation."""
-        return np.sqrt(
-            _direction_delta(self.dir_phi[cand], query_phi) ** 2
-            + (self.eta[cand] - target_eta) ** 2
-        )
+        """The exact library.py metric, never the grid's approximation.
+
+        Inlined rather than calling ``_direction_delta`` so the intermediate
+        arrays are reused; ``tests/test_match.py`` pins the result against
+        ``library.py`` bit for bit, which is what makes inlining safe.
+        """
+        d = np.abs(self.dir_phi[cand] - query_phi)
+        np.mod(d, _TWO_PI, out=d)
+        np.minimum(d, _TWO_PI - d, out=d)
+        np.square(d, out=d)
+        e = self.eta[cand] - target_eta
+        np.square(e, out=e)
+        d += e
+        return np.sqrt(d, out=d)
 
     def find_partner(self, i, *, respect_availability=True):
         """The best partner for seed ``i``.
@@ -387,11 +438,12 @@ class Matcher:
         s0, s1 = g.slab_range(pt_i)
         if s1 < s0:
             return None, np.inf
-        phi_c = int(g._phi_cell(np.array([qphi]))[0])
-        eta_c = int(g._eta_cell(np.array([tgt]))[0])
+        phi_c = g._phi_cell1(qphi)
+        eta_c = g._eta_cell1(tgt)
 
         best, best_d = -1, np.inf
         for r in range(g.max_ring + 1):
+            self._stat_rings += 1
             cand = g.ring(s0, s1, phi_c, eta_c, r)
             if cand is not None and len(cand):
                 ok = (self.pt[cand] >= lo) & (self.pt[cand] <= hi)
@@ -426,6 +478,38 @@ class Matcher:
             return None, best_d
         return best, best_d
 
+    def window_counts(self, i):
+        """``(n_in_window, n_available_in_window)`` excluding this event.
+
+        Both exact. The population is a contiguous run of the pT-sorted order,
+        so its size is a subtraction; the available count is whole-block sums
+        plus the two partial ends.
+        """
+        lo, hi = self.grid.window_bounds(self.pt[i])
+        a = int(np.searchsorted(self.grid.pt_sorted, lo, side="left"))
+        z = int(np.searchsorted(self.grid.pt_sorted, hi, side="right"))
+        if z <= a:
+            return 0, 0
+
+        # the seed is always inside its own window; its sibling may be too
+        drop = 1
+        sib = int(self.sibling[i])
+        if sib >= 0 and lo <= self.pt[sib] <= hi:
+            drop += 1
+        n_in = (z - a) - drop
+
+        b0, b1 = -(-a // self.BLOCK), z // self.BLOCK      # whole blocks [b0, b1)
+        if b1 <= b0:
+            n_av = int(self.available[self.grid.pt_order[a:z]].sum())
+        else:
+            n_av = int(self._blk_avail[b0:b1].sum())
+            n_av += int(self.available[self.grid.pt_order[a:b0 * self.BLOCK]].sum())
+            n_av += int(self.available[self.grid.pt_order[b1 * self.BLOCK:z]].sum())
+        n_av -= int(self.available[i])
+        if sib >= 0 and lo <= self.pt[sib] <= hi:
+            n_av -= int(self.available[sib])
+        return max(n_in, 0), max(n_av, 0)
+
     def classify_failure(self, i, best_distance):
         """Why seed ``i`` failed, and the numbers that make it interpretable.
 
@@ -438,10 +522,7 @@ class Matcher:
         availability - the counterfactual that separates a supply failure from a
         geometric one.
         """
-        rows = self.grid.window_rows(self.pt[i])
-        rows = rows[self.event_key[rows] != self.event_key[i]]
-        n_in = int(len(rows))
-        n_avail = int(self.available[rows].sum()) if n_in else 0
+        n_in, n_avail = self.window_counts(i)
 
         if n_in == 0:
             return REASON_WINDOW_EMPTY, n_in, n_avail, np.inf
@@ -454,9 +535,48 @@ class Matcher:
         return reason, n_in, n_avail, best_full
 
     def run(self, *, on_pair=None, on_unmatched=None, progress=False,
-            min_fill_rate=None, check_every=10_000):
-        """Draw until the pool is dry. Returns counters."""
+            min_fill_rate=None, check_every=10_000,
+            rate_log=None, rate_every=10_000):
+        """Draw until the pool is dry. Returns counters.
+
+        ``rate_log`` is a path to a CSV sampled every ``rate_every`` draws. The
+        throughput is strongly dependent on how depleted the pool is - as
+        hemispheres are consumed the survivors are further apart, so the ring
+        search expands and more draws fail - and that curve is worth having
+        rather than inferring from a progress bar.
+        """
+        import time
+
         n_pairs = n_fail = 0
+        log = None
+        if rate_log:
+            os.makedirs(os.path.dirname(str(rate_log)) or ".", exist_ok=True)
+            log = open(rate_log, "w", buffering=1)
+            log.write("elapsed_s,draws,remaining,consumed,pairs,unmatched,"
+                      "hemi_per_s,mean_rings,frac_failed\n")
+        t_start = t_last = time.monotonic()
+        last_draws = last_consumed = last_pairs = last_fail = 0
+
+        def sample(final=False):
+            nonlocal t_last, last_draws, last_consumed, last_pairs, last_fail
+            if log is None:
+                return
+            now = time.monotonic()
+            dt = now - t_last
+            consumed = self.n - self.n_available
+            d_hemi = consumed - last_consumed
+            d_draw = max(self.draw_index - last_draws, 1)
+            d_fail = n_fail - last_fail
+            log.write(
+                f"{now - t_start:.3f},{self.draw_index},{self.n_available},"
+                f"{consumed},{n_pairs},{n_fail},"
+                f"{d_hemi / dt if dt > 0 else 0:.2f},"
+                f"{self._stat_rings / d_draw:.3f},"
+                f"{d_fail / d_draw:.4f}\n")
+            t_last, last_draws, last_consumed = now, self.draw_index, consumed
+            last_pairs, last_fail = n_pairs, n_fail
+            self._stat_rings = 0
+
         bar = None
         if progress:
             try:
@@ -486,6 +606,9 @@ class Matcher:
                     on_pair(i, j, d, self.draw_index)
                 n_pairs += 1
 
+            if log is not None and self.draw_index % rate_every == 0:
+                sample()
+
             if (min_fill_rate is not None and n_pairs + n_fail >= check_every
                     and (n_pairs + n_fail) % check_every == 0):
                 rate = n_pairs / float(n_pairs + n_fail)
@@ -496,6 +619,9 @@ class Matcher:
 
         if bar is not None:
             bar.close()
+        if log is not None:
+            sample(final=True)
+            log.close()
         return {"pairs": n_pairs, "unmatched": n_fail,
                 "draws": self.draw_index, "left": self.n_available}
 
@@ -651,6 +777,15 @@ def main(argv=None):
     p.add_argument("--pt-tolerance", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--pairs-per-chunk", type=int, default=100_000)
+    p.add_argument("--rate-log", default=None, metavar="CSV",
+                   help="sample throughput to a CSV (default "
+                        "<out-dir>/match_rate.csv). Columns: elapsed_s, draws, "
+                        "remaining, consumed, pairs, unmatched, hemi_per_s, "
+                        "mean_rings, frac_failed - enough to plot rate against "
+                        "how depleted the pool is, and to see whether a slowdown "
+                        "is the search expanding or draws starting to fail.")
+    p.add_argument("--rate-every", type=int, default=10_000, metavar="N",
+                   help="draws between rate samples (default 10,000)")
     p.add_argument("--min-fill-rate", type=float, default=None,
                    help="stop early when the running success rate drops below "
                         "this, rather than draining the pool")
@@ -691,8 +826,10 @@ def main(argv=None):
     print(f"index:   {len(ix):,} hemispheres  (id {ix.manifest['index_id']})")
     print(f"cuts:    pT window +-{args.pt_tolerance:g}, max_distance "
           f"{args.max_distance:g}, seed {args.seed}")
+    rate_log = args.rate_log or os.path.join(args.out_dir, "match_rate.csv")
     counters = m.run(on_pair=pw.add, on_unmatched=uw.add,
-                     progress=args.progress, min_fill_rate=args.min_fill_rate)
+                     progress=args.progress, min_fill_rate=args.min_fill_rate,
+                     rate_log=rate_log, rate_every=args.rate_every)
     pw.flush()
     n_unmatched = uw.write(os.path.join(args.out_dir, "unmatched.root"))
 
@@ -737,6 +874,7 @@ def main(argv=None):
     for label, k in breakdown.items():
         print(f"    {label:<14} {k:,}")
     print(f"chunks:     {len(pw.chunks)}")
+    print(f"rate log:   {rate_log}")
     print(f"-> {args.out_dir}/")
     return 0
 
