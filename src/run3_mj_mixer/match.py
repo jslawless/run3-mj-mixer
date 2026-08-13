@@ -210,6 +210,7 @@ class Grid:
         eta_c = np.clip(self._eta_cell(self.eta), 0, self.n_eta - 1)
         bucket = (slab * self.n_phi + phi_c) * self.n_eta + eta_c
         self.n_bucket = self.n_slab * self.n_phi * self.n_eta
+        self.bucket_of = bucket
 
         self.rows = np.argsort(bucket, kind="stable").astype(np.int64)
         counts = np.bincount(bucket, minlength=self.n_bucket)
@@ -263,20 +264,32 @@ class Grid:
         return (max(self._slab_of1(lo), 0),
                 min(self._slab_of1(hi), self.n_slab - 1))
 
-    def ring(self, s0, s1, phi_c, eta_c, r):
-        """Rows in the cells at Chebyshev distance exactly ``r`` from the query."""
-        chunks = []
+    def ring_buckets(self, s0, s1, phi_c, eta_c, r):
+        """Bucket indices at Chebyshev distance exactly ``r`` from the query.
+
+        Buckets, not rows: late in a run almost every nearby bucket has been
+        entirely consumed, and the caller can check a per-bucket available count
+        in O(1) rather than slicing and filtering rows that are all gone.
+        """
+        out = []
+        n_pe = self.n_phi * self.n_eta
         for dphi, deta in self._ring_offsets[r]:
             e = eta_c + deta
             if not (0 <= e < self.n_eta):
                 continue
             p = (phi_c + dphi) % self.n_phi          # phi is periodic
-            base = (p * self.n_eta + e)
+            base = p * self.n_eta + e
             for sl in range(s0, s1 + 1):
-                b = sl * self.n_phi * self.n_eta + base
-                a, z = self.starts[b], self.starts[b + 1]
-                if z > a:
-                    chunks.append(self.rows[a:z])
+                out.append(sl * n_pe + base)
+        return out
+
+    def gather(self, buckets):
+        """Rows of the given buckets."""
+        chunks = []
+        for b in buckets:
+            a, z = self.starts[b], self.starts[b + 1]
+            if z > a:
+                chunks.append(self.rows[a:z])
         if not chunks:
             return None
         if len(chunks) == 1:
@@ -347,6 +360,13 @@ class Matcher:
 
         self._rank = np.empty(self.n, dtype=np.int64)
         self._rank[self.grid.pt_order] = np.arange(self.n)
+        # Available rows per bucket. Once the pool is mostly consumed, this
+        # turns the endgame ring expansion from "slice and filter hundreds of
+        # buckets" into "check hundreds of ints", which is the difference
+        # between a full search costing milliseconds and microseconds.
+        self._cell_avail = np.bincount(
+            self.grid.bucket_of, minlength=self.grid.n_bucket).astype(np.int32)
+
         self._nblk = (self.n + self.BLOCK - 1) // self.BLOCK
         self._blk_avail = np.full(self._nblk, self.BLOCK, dtype=np.int32)
         if self.n:
@@ -377,6 +397,7 @@ class Matcher:
             return
         self.available[i] = False
         self._blk_avail[self._rank[i] // self.BLOCK] -= 1
+        self._cell_avail[self.grid.bucket_of[i]] -= 1
         pos = self._avail_pos[i]
         last = self._avail[-1]
         self._avail[pos] = last
@@ -416,7 +437,7 @@ class Matcher:
         d += e
         return np.sqrt(d, out=d)
 
-    def find_partner(self, i, *, respect_availability=True):
+    def find_partner(self, i, *, respect_availability=True, stop_within=None):
         """The best partner for seed ``i``.
 
         Pure - mutates nothing. Returns ``(match, distance)`` with ``match=None``
@@ -444,7 +465,11 @@ class Matcher:
         best, best_d = -1, np.inf
         for r in range(g.max_ring + 1):
             self._stat_rings += 1
-            cand = g.ring(s0, s1, phi_c, eta_c, r)
+            buckets = g.ring_buckets(s0, s1, phi_c, eta_c, r)
+            if respect_availability:
+                ca = self._cell_avail
+                buckets = [b for b in buckets if ca[b]]
+            cand = g.gather(buckets) if buckets else None
             if cand is not None and len(cand):
                 ok = (self.pt[cand] >= lo) & (self.pt[cand] <= hi)
                 ok &= self.event_key[cand] != key_i
@@ -468,6 +493,9 @@ class Matcher:
             # within that is provably the global best.
             covered = r * g.cell_w
             if best >= 0 and best_d <= covered:
+                break
+            # Caller only needs existence, not the argmin (see classify_failure).
+            if stop_within is not None and best >= 0 and best_d <= stop_within:
                 break
             if covered > self.max_distance:
                 break
@@ -529,7 +557,13 @@ class Matcher:
         if n_avail == 0:
             return REASON_ALL_CONSUMED, n_in, n_avail, np.inf
 
-        _, best_full = self.find_partner(i, respect_availability=False)
+        # Against the FULL pool this only has to answer "would anything have
+        # matched", so stop at the first candidate inside the cut rather than
+        # proving which is nearest. When nothing is inside the cut the search is
+        # exhaustive anyway, so the reported distance is exact in the case where
+        # its value carries information (INTRINSIC).
+        _, best_full = self.find_partner(i, respect_availability=False,
+                                         stop_within=self.max_distance)
         reason = (REASON_TOO_FAR_DEPLETED if best_full <= self.max_distance
                   else REASON_TOO_FAR_INTRINSIC)
         return reason, n_in, n_avail, best_full
