@@ -26,13 +26,10 @@ what eventually walks a job into the limit. **Bytes read vs work** says whether
 reads are proportional or whether jobs pay to open files they barely touch.
 
 A stage may also declare a `Grouper`, which turns its own stdout into a label
-per job and adds a flag to colour by it (stage 1a: HT slice). Groups are drawn
-from an **ordinal** blue ramp in group order, not from categorical hues: HT
-slices are ordered bins of one quantity, so the encoding should carry that
-order. The cost is that adjacent slices are deliberately similar - about 4.7
-OKLab lightness apart at eight groups, 4.35 under CVD simulation - which is why
-grouping also prints an exact per-group table, so no reading depends on telling
-two shades apart.
+per job and adds a flag to key by it (stage 1a: HT slice). Groups are keyed by
+**hue and marker shape together** - see `CATEGORICAL` for why three hues rather
+than one per group. Grouping also prints an exact per-group table, so no
+reading depends on telling two marks apart.
 """
 
 from __future__ import annotations
@@ -59,7 +56,8 @@ Metric = namedtuple("Metric", "key pattern group label")
 #: An optional way for a stage to split its jobs. `fn` reads the job's stdout
 #: and returns a label (or None); `order` sorts the labels; `flag` is the
 #: command-line switch that turns colouring on; `neutral` names the labels that
-#: are outside the ordered sequence, so they are not given a ramp step.
+#: are outside the ordered sequence, so they get neutral ink and their own
+#: shape rather than one of the sequence's keys.
 Grouper = namedtuple("Grouper", "flag dest label help fn order neutral")
 
 # Series colours are slots 1-3 of the validated categorical palette, in fixed
@@ -75,88 +73,52 @@ THEME = {
              "series": ("#3987e5", "#d95926", "#199e70")},
 }
 
-# The blue ramp's named steps, for ordinal groups. Light mode runs 250 -> 700
-# and dark mode 600 -> 100: in both, later groups sit further from the surface,
-# so the step nearest it still clears the 2:1 floor (2.06:1 on light, 2.15:1 on
-# dark). More groups than named steps are served by interpolating between them,
-# never by cycling or by borrowing another hue.
-RAMP = {
-    "light": ("#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6",
-              "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"),
-    "dark": ("#184f95", "#1c5cab", "#256abf", "#2a78d6", "#3987e5",
-             "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6",
-             "#cde2fb"),
-}
-
-#: Shades closer than this in OKLab lightness (x100) cannot be told apart, so
-#: the run says so rather than implying the figure is readable.
-READABLE_SEPARATION = 4.0
-
-_TO_LMS = np.array([[0.4122214708, 0.5363325363, 0.0514459929],
-                    [0.2119034982, 0.6806995451, 0.1073969566],
-                    [0.0883024619, 0.2817188376, 0.6299787005]])
-_TO_LAB = np.array([[0.2104542553, 0.7936177850, -0.0040720468],
-                    [1.9779984951, -2.4285922050, 0.4505937099],
-                    [0.0259040371, 0.7827717662, -0.8086757660]])
+# Groups are keyed by hue AND marker shape together. Three hues is not a
+# stylistic choice: this is a scatter, so any two groups can land side by side
+# and EVERY pair has to separate, not just neighbours in a legend. Measured on
+# the categorical palette, all-pairs worst case:
+#
+#     slots   normal-vision dE          CVD dE (floor 8)
+#       3     24.0 light / 20.9 dark    9.9 light / 10.1 dark   PASS
+#       4     13.7 light / 10.6 dark    9.5 light /  4.7 dark   FAIL
+#       8      7.1 light /  7.1 dark    3.3 light /  1.6 dark   FAIL
+#
+# Eight hues in a scatter are not eight identities - under CVD they are close
+# to one. So hue carries three states and shape carries the rest, giving 12
+# combinations that are all distinct in at least one channel, and distinct in
+# greyscale and under any CVD. Hue cycles fastest so that ADJACENT groups - the
+# ones most often confused - always differ in colour, never only in shape.
+CATEGORICAL = {"light": ("#2a78d6", "#eb6834", "#1baf7a"),
+               "dark": ("#3987e5", "#d95926", "#199e70")}
+#: Sized to roughly equal visual weight; matplotlib's 's' is area, not extent.
+MARKERS = (("o", 30), ("^", 38), ("s", 28), ("D", 24))
+#: For groups outside the ordered sequence, in neutral ink with its own shape.
+NEUTRAL_MARKER = ("P", 40)
 
 
-def _oklab(hex_):
-    c = np.array([int(hex_.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4)])
-    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-    return _TO_LAB @ np.cbrt(_TO_LMS @ lin)
+def group_styles(groups, theme, neutral=()):
+    """[(label, colour, marker, size), ...] in group order.
 
-
-def _hex(lab):
-    lin = np.linalg.solve(_TO_LMS, np.linalg.solve(_TO_LAB, lab) ** 3)
-    lin = np.clip(lin, 0, 1)
-    s = np.where(lin <= 0.0031308, lin * 12.92,
-                 1.055 * lin ** (1 / 2.4) - 0.055)
-    return "#" + "".join(f"{int(round(v * 255)):02x}" for v in s)
-
-
-def _ramp_lab(n, theme):
-    """`n` points evenly spaced along the ramp, in OKLab.
-
-    Interpolating rather than picking nearest named steps matters once the
-    group count stops dividing the ramp: choosing 11 of 19 half-steps leaves
-    some neighbours 2.2 apart in lightness and others 4.5, so the shading stops
-    reading as even progress. Interpolated, the gaps agree to a few percent -
-    the named steps are themselves 4.6 to 5.0 apart, and staying on them at
-    whole-step counts is worth more than making that residue exactly zero. At
-    exactly as many groups as named steps the positions land back on them.
+    Labels outside the sequence - "several slices", an unrecognised name - take
+    neutral ink and their own shape, so they never read as one of the ordered
+    groups.
     """
-    lab = np.array([_oklab(h) for h in RAMP[theme]])
-    if n == 1:
-        return lab[len(lab) // 2:len(lab) // 2 + 1]
-    pos = np.linspace(0, len(lab) - 1, n)
-    lo = np.floor(pos).astype(int)
-    hi = np.minimum(lo + 1, len(lab) - 1)
-    frac = (pos - lo)[:, None]
-    return lab[lo] * (1 - frac) + lab[hi] * frac
-
-
-def ramp_colours(n, theme):
-    """`n` shades spread across the ramp, in group order."""
-    return [_hex(v) for v in _ramp_lab(n, theme)]
-
-
-def ramp_separation(n, theme):
-    """Smallest lightness gap between neighbouring shades, OKLab x100."""
-    if n < 2:
-        return np.inf
-    return float(np.min(np.abs(np.diff(_ramp_lab(n, theme)[:, 0])))) * 100
-
-
-def group_colours(groups, theme, neutral=()):
-    """[(label, colour), ...] in group order.
-
-    Labels outside the ordered sequence - "several slices", an unrecognised
-    name - take neutral ink rather than a ramp step. Given one they would read
-    as the sequence's extreme, which is the opposite of what they mean.
-    """
+    hues = CATEGORICAL[theme]
+    limit = len(hues) * len(MARKERS)
     ordered = [g for g in groups if g not in neutral]
-    shades = dict(zip(ordered, ramp_colours(len(ordered), theme)))
-    return [(g, shades.get(g, THEME[theme]["ink2"])) for g in groups]
+    if len(ordered) > limit:
+        raise SystemExit(
+            f"{len(ordered)} groups is more than the {limit} hue x shape "
+            f"combinations available ({len(hues)} hues that separate in a "
+            f"scatter, {len(MARKERS)} shapes). Beyond this a key would have to "
+            "repeat, which reads as two groups being the same one.")
+    style = {}
+    for i, g in enumerate(ordered):
+        marker, size = MARKERS[i // len(hues)]
+        style[g] = (hues[i % len(hues)], marker, size)
+    ink = THEME[theme]["ink2"]
+    return [(g,) + style.get(g, (ink,) + NEUTRAL_MARKER) for g in groups]
+
 
 #: (column, panel title, unit, scale from the recorded unit)
 PANELS = [("wall_s", "Wall time on the worker", "s", 1.0),
@@ -337,8 +299,8 @@ def _scale(ax, which, log, values, origin, comma, n_ticks):
 def summarize_groups(runs, met, grouper):
     """A per-group table, printed whenever colouring by group.
 
-    The ramp is ordinal, so adjacent groups are close by design; these are the
-    numbers, so nothing has to be read off a shade.
+    Eleven groups is more than any key reads cleanly at, so these are the
+    numbers - nothing has to be read off a mark.
     """
     rows = [r for _, rows in runs for r in rows]
     groups = group_order(runs, grouper)
@@ -372,7 +334,7 @@ def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
     """`runs` is [(name, rows), ...] - several are overlaid for comparison.
 
     `groups`, when given, is [(label, colour), ...] in group order; points are
-    then coloured by group instead of by run.
+    then keyed by group instead of coloured by run.
     """
     t = THEME[theme]
     comma = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.6g}")
@@ -401,13 +363,13 @@ def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
 
             if groups:
                 # One scatter per group, in group order, so the legend reads in
-                # that order too and the shading is interpretable as a sequence.
+                # that order too.
                 who = np.array([r.get("group") for r in rows], dtype=object)
-                for g, shade in groups:
+                for g, colour, marker, size in groups:
                     sel = m & ok & (who == g)
                     if sel.any():
-                        ax.scatter(x[sel], y[sel], s=26, c=shade, alpha=0.85,
-                                   edgecolors="none", label=g)
+                        ax.scatter(x[sel], y[sel], s=size, c=colour, alpha=0.8,
+                                   marker=marker, edgecolors="none", label=g)
             else:
                 # A lone unnamed series needs no legend entry - the panel title
                 # already says what it is. With several runs the name is the
@@ -447,7 +409,7 @@ def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
     if len(runs) > 1:
         head += f" over {len(runs)} runs"
     if group_label:
-        head += f"   coloured by {group_label}"
+        head += f"   keyed by {group_label}"
     if n_bad:
         head += f"   {n_bad} not ok"
     # A job with no work count is not on the scatter, so the header would
@@ -467,8 +429,8 @@ def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
     if not pairs:
         fig.tight_layout(rect=(0, 0, 1, 0.93))
     elif groups:
-        # Down the right, one entry per line: an ordinal ramp has to be read as
-        # a sequence, and a wrapped multi-column legend fills column-major, so
+        # Down the right, one entry per line: the groups are an ordered
+        # sequence, and a wrapped multi-column legend fills column-major, so
         # the order would come out scrambled.
         fig.tight_layout(rect=(0, 0, 0.88, 0.93))
         fig.legend(list(pairs.values()), list(pairs), frameon=False, ncol=1,
@@ -565,14 +527,6 @@ def run_cli(stage, metrics, doc, grouper=None, argv=None):
     groups = None
     if by_group:
         print(summarize_groups(runs, met, grouper))
-        n_shaded = sum(1 for g in group_order(runs, grouper)
-                       if g not in grouper.neutral)
-        gap = ramp_separation(n_shaded, "dark" if args.dark else "light")
-        if gap < READABLE_SEPARATION:
-            print(f"note: {n_shaded} shaded groups leaves neighbouring shades "
-                  f"{gap:.1f} apart in lightness (readable is about "
-                  f"{READABLE_SEPARATION:.0f}+); adjacent {grouper.label}s "
-                  "will not be separable by eye - read the table above.")
 
     if args.csv:
         write_csv(args.csv, runs)
@@ -583,8 +537,8 @@ def run_cli(stage, metrics, doc, grouper=None, argv=None):
 
     theme = "dark" if args.dark else "light"
     if by_group:
-        groups = group_colours(group_order(runs, grouper), theme,
-                               grouper.neutral)
+        groups = group_styles(group_order(runs, grouper), theme,
+                              grouper.neutral)
     fig = plt.figure(figsize=(13.5, 4.4))
     draw(fig, runs, met, stage, theme, logx=args.logx, logy=args.logy,
          origin=args.origin, groups=groups,

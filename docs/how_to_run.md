@@ -278,7 +278,7 @@ python scripts/monitors/plot_gather_jobs.py batch_gather_60 batch_gather_120 \
     --label "60 jobs" "120 jobs" -o gather_scaling.png
 ```
 
-Stage 1a also takes `--by-slice`, which colours each job by the HT slice of its
+Stage 1a also takes `--by-slice`, which keys each job by the HT slice of its
 input files and prints the per-slice table:
 
 ```bash
@@ -292,13 +292,18 @@ they all pile against the left edge. `--logy` exists but is rarely wanted —
 within one submission wall time and peak memory span well under a decade.
 
 The slices span orders of magnitude in events per file, so this is what
-separates "that job was slow" from "that slice is big". The shading is an
-ordinal ramp in HT order — the slices are ordered bins of one quantity, so
-adjacent ones are deliberately close, and the printed table is there so no
-number has to be read off a shade. A job whose files straddle a slice boundary
-is labelled `several slices` in neutral grey rather than filed under whichever
-slice came first. The slice label comes from `filetable.slice_or_unknown`, the
-same function that routes the output directories.
+separates "that job was slow" from "that slice is big". Slices are keyed by
+**hue and marker shape together**, three hues cycling fastest so neighbouring
+slices always differ in colour. That is a measured constraint, not a
+preference: in a scatter any two groups can land side by side, so every pair
+has to separate, and the categorical palette's fourth hue drops the worst pair
+to CVD ΔE 4.7 against a floor of 8 — eleven hues would look like more
+information while carrying less. The printed table is there so no number has to
+be read off a mark at all. A job whose files straddle a slice boundary is
+labelled `several slices` in neutral grey with its own shape, rather than being
+filed under whichever slice came first. The slice label comes from
+`filetable.slice_or_unknown`, the same function that routes the output
+directories.
 
 ## 12. QA
 
