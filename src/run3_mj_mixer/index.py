@@ -198,6 +198,64 @@ class IncompleteShard(RuntimeError):
     """A shard without its ``complete`` marker - truncated, or a dead job."""
 
 
+def read_shard_header(path, *, require_complete=True):
+    """Just the small objects: no TTree columns read at all.
+
+    Stage 1b needs two things from every shard before it can allocate the merged
+    columns - which file it came from, and how many rows it has - and both are in
+    the metadata. Reading the full columns to find that out doubles the xrootd
+    traffic over thousands of shards for nothing.
+
+    Returns ``(n_rows, meta)``. ``n_rows`` is the tree's ``num_entries``, and
+    the merge re-checks it against the real column length when it reads them.
+    """
+    import uproot
+
+    with uproot.open(path) as f:
+        keys = {k.split(";")[0] for k in f.keys()}
+        if require_complete and COMPLETE_MARKER not in keys:
+            raise IncompleteShard(
+                f"{path} has no '{COMPLETE_MARKER}' marker - it was truncated or "
+                "the job that wrote it died. Re-run that job; including it would "
+                "silently shorten the index."
+            )
+
+        def _label(name, cast=str):
+            if name not in keys:
+                return None
+            lbl = _label_of(f[name].to_boost())
+            return None if lbl is None else cast(lbl)
+
+        meta = {
+            "source_path": _label("source_path"),
+            "schema_version": _label("schema_version", int),
+            "version": _label("version"),
+            "dataset": _label("dataset"),
+            "cutflow": {},
+        }
+        if "index_cutflow" in keys:
+            vals = f["index_cutflow"].values()
+            meta["cutflow"] = {
+                label: float(v) for label, v in zip(SHARD_CUTFLOW_BINS, vals)
+            }
+        # num_entries, NOT the cutflow: it is the authoritative row count and is
+        # just as cheap (tree metadata, no columns). Trusting the cutflow means a
+        # shard with a tree but a missing or wrong cutflow reports zero rows and
+        # gets silently dropped from the merge.
+        n_rows = int(f[SHARD_TREE].num_entries) if SHARD_TREE in keys else 0
+
+        # The shard also carries file_hash per row. Prefer source_path (free),
+        # but fall back to one value of that column so a shard without the
+        # metadata objects is still placeable - it is one branch, one entry.
+        if meta["source_path"] is None and n_rows:
+            meta["file_hash"] = int(
+                f[SHARD_TREE]["file_hash"].array(entry_stop=1, library="np")[0])
+        else:
+            meta["file_hash"] = (file_hash(meta["source_path"])
+                                 if meta["source_path"] else None)
+        return n_rows, meta
+
+
 def read_shard(path, *, require_complete=True):
     """Read one index shard.
 

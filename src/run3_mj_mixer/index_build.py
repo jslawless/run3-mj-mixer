@@ -34,6 +34,7 @@ import numpy as np
 
 from . import filetable as ft
 from . import index as idx
+from .filetable import _progress
 
 SCHEMA = "run3-mj-hemisphere-index"
 SCHEMA_VERSION = 1
@@ -80,23 +81,30 @@ def _npy(out_dir, name):
     return os.path.join(str(out_dir), f"{name}.npy")
 
 
-def scan_shards(paths, table, *, require_complete=True, skip_unlisted=False):
-    """First pass: validate shards and work out where each one lands.
+def scan_shards(paths, table, *, require_complete=True, skip_unlisted=False,
+                progress=False):
+    """First pass: work out where each shard lands, from its METADATA only.
 
-    Returns a list of ``{path, file_id, n_rows}`` sorted by ``file_id``, which
-    is the order the second pass concatenates in.
+    Reads no TTree columns - the file it came from and its row count are both in
+    the small objects, so a full read here would double the xrootd traffic over
+    thousands of shards. Checks that need the columns (internal sort order, and
+    that the row count is honest) happen in the second pass, where they are read
+    anyway.
+
+    Returns ``(plan, skipped)``; ``plan`` is sorted by ``file_id``, which is the
+    order the second pass concatenates in.
     """
     h2id = ft.hash_to_id(table)
     plan, seen_ids, skipped = [], {}, []
-    for p in paths:
-        cols, meta = idx.read_shard(p, require_complete=require_complete)
-        n = len(cols["entry"])
+    for p in _progress(paths, total=len(paths), enabled=progress,
+                       desc="scanning shards", unit="shard"):
+        n, meta = idx.read_shard_header(p, require_complete=require_complete)
         if n == 0:
             # A legitimately empty slice. It contributes no rows but its file is
             # still in the table and still counted in the denominator.
             fid = None
-            if meta["source_path"] is not None:
-                fid = h2id.get(idx.file_hash(meta["source_path"]))
+            if meta.get("file_hash") is not None:
+                fid = h2id.get(meta["file_hash"])
             if fid is None and skip_unlisted:
                 # Also unlisted, just with nothing in it - count it as skipped so
                 # the reported totals add up.
@@ -105,13 +113,12 @@ def scan_shards(paths, table, *, require_complete=True, skip_unlisted=False):
             plan.append({"path": str(p), "file_id": fid, "n_rows": 0})
             continue
 
-        hashes = np.unique(cols["file_hash"])
-        if len(hashes) != 1:
+        fh = meta.get("file_hash")
+        if fh is None:
             raise ValueError(
-                f"{p} mixes {len(hashes)} file_hashes; a shard must come from "
-                "exactly one input file."
+                f"{p} records neither a source_path nor a file_hash, so it "
+                "cannot be matched to the file table. Re-run stage 1a for it."
             )
-        fh = int(hashes[0])
         if fh not in h2id:
             # Two very different situations, so do not guess between them:
             # the shard is for a file deliberately left out of the sample
@@ -137,15 +144,6 @@ def scan_shards(paths, table, *, require_complete=True, skip_unlisted=False):
             )
         seen_ids[fid] = str(p)
 
-        # Stage 1a emits rows already in (entry, hemi_slot) order; the pure
-        # concatenation below is only correct if that holds, so check rather
-        # than assume.
-        key = cols["entry"].astype(np.int64) * 4 + cols["hemi_slot"]
-        if np.any(np.diff(key) < 0):
-            raise ValueError(
-                f"{p} is not sorted by (entry, hemi_slot); the merge assumes "
-                "shard-internal order."
-            )
         plan.append({"path": str(p), "file_id": fid, "n_rows": n})
 
     plan.sort(key=lambda r: (r["file_id"] is None, r["file_id"]))
@@ -163,7 +161,8 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
     os.makedirs(str(out_dir), exist_ok=True)
     plan, skipped = scan_shards(shard_paths, table,
                                 require_complete=require_complete,
-                                skip_unlisted=skip_unlisted)
+                                skip_unlisted=skip_unlisted,
+                                progress=progress)
     if skipped:
         # Loud, and grouped, so "I meant to drop those" and "my table is short"
         # look different at a glance.
@@ -182,13 +181,8 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
     n_files = max((int(r["file_id"]) for r in table["files"]), default=-1) + 1
     offsets = np.zeros(n_files + 1, dtype=np.int64)
 
-    it = plan
-    if progress:
-        try:
-            from tqdm import tqdm
-            it = tqdm(plan, unit="shard", desc="merging")
-        except ImportError:
-            pass
+    it = _progress(plan, total=len(plan), enabled=progress,
+                   desc="merging shards", unit="shard")
 
     pos = 0
     for rec in it:
@@ -196,6 +190,22 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
             continue
         cols, _ = idx.read_shard(rec["path"], require_complete=require_complete)
         n = len(cols["entry"])
+        # The row count came from the cutflow in pass 1 and sized the output, so
+        # check the columns actually agree rather than writing a short block.
+        if n != rec["n_rows"]:
+            raise ValueError(
+                f"{rec['path']}: header said {rec['n_rows']} rows but the "
+                f"columns have {n}. The shard changed between passes, or is "
+                "inconsistent - re-run stage 1a for it."
+            )
+        # Pass 1 reads no columns, so the internal-order check lands here. The
+        # merge is a pure concatenation, which is only correct if it holds.
+        key = cols["entry"].astype(np.int64) * 4 + cols["hemi_slot"]
+        if np.any(np.diff(key) < 0):
+            raise ValueError(
+                f"{rec['path']} is not sorted by (entry, hemi_slot); the merge "
+                "assumes shard-internal order."
+            )
         fid = int(rec["file_id"])
         sl = slice(pos, pos + n)
         for name, dt in CARRIED.items():

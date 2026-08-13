@@ -129,14 +129,53 @@ UNMATCHED_COLUMNS = {
 # The bucket grid
 # ---------------------------------------------------------------------------
 
+def choose_cell_width(n, n_slab, eta_span, max_distance, *, target_rows=64):
+    """Cell width that keeps the innermost ring at about ``target_rows``.
+
+    Ring 0 gathers one (phi, eta) cell across the ~3 pT slabs a +-tol window
+    spans, so ``rows ~ 3n / (n_slab * n_phi * n_eta)``; with square cells
+    ``n_phi * n_eta = 2*pi*eta_span / w**2``, which solves for w.
+
+    Sizing from ``n`` rather than fixing a fraction of ``max_distance`` is what
+    keeps query cost flat as the sample grows - a fixed width means occupancy,
+    and therefore work per query, scales with n.
+
+    Clamped to ``max_distance`` above (the ring bound needs several rings to
+    reach the cut, and below ~1e5 rows coarse cells are simply better) and to
+    ``max_distance/512`` below (per-ring Python overhead starts to dominate).
+    """
+    if n <= 0:
+        return max_distance
+    want_cells = max(1.0, 3.0 * n / (target_rows * max(n_slab, 1)))
+    w = math.sqrt(_TWO_PI * max(eta_span, 1e-6) / want_cells)
+    return min(max(w, max_distance / 512.0), max_distance)
+
+
 class Grid:
     """Bucketed (pT slab, directed-phi cell, eta cell) candidate lookup.
 
-    Every cell is at least ``max_distance`` wide, which is what makes a 3x3
-    neighbourhood search exhaustive rather than approximate.
+    Cells are much FINER than ``max_distance`` and the search expands in rings
+    until the answer is provably found. The obvious alternative - cells exactly
+    ``max_distance`` wide, so a 3x3 neighbourhood is guaranteed to contain every
+    candidate - is correct but gathers the whole 3x3 every time. At 2e7
+    hemispheres that is ~2.6e5 candidates per query when the typical match sits
+    at distance ~0.002, i.e. three orders of magnitude of wasted work.
+
+    The ring bound is exact. After gathering every cell within Chebyshev
+    distance ``r`` of the query's cell, any point not gathered differs by at
+    least ``r`` whole cells along some axis, so it is at least ``r * cell_w``
+    away. Once the best candidate found is within ``r * cell_w``, nothing
+    outside can beat it and the search stops.
     """
 
-    def __init__(self, pt, dir_phi, eta, *, max_distance, pt_tolerance):
+    #: Rows the innermost ring should hold. Cells are sized from N to hit this,
+    #: so query cost stays flat as the sample grows instead of scaling with
+    #: occupancy. Too small and per-ring Python overhead dominates; ~64 balances
+    #: the two.
+    TARGET_RING0_ROWS = 64
+
+    def __init__(self, pt, dir_phi, eta, *, max_distance, pt_tolerance,
+                 cell_w=None):
         self.max_distance = float(max_distance)
         self.pt_tolerance = float(pt_tolerance)
         n = len(pt)
@@ -145,20 +184,27 @@ class Grid:
         self.dir_phi = np.asarray(dir_phi, dtype=np.float64)
         self.eta = np.asarray(eta, dtype=np.float64)
 
-        # pT slabs: one tolerance unit wide, so a +-tol window spans a bounded
-        # number of them regardless of scale.
+        # pT slabs one tolerance unit wide, so a +-tol window spans a bounded
+        # number of them at any scale.
         self.pt_min = float(self.pt[self.pt > 0].min()) if np.any(self.pt > 0) else 1.0
         self.log_step = math.log1p(self.pt_tolerance)
         slab = self._slab_of(self.pt)
         self.n_slab = int(slab.max()) + 1 if n else 1
 
-        w = self.max_distance
-        self.n_phi = max(3, int(math.floor(_TWO_PI / w)))
+        if cell_w is None:
+            eta_span = float(self.eta.max() - self.eta.min()) if n else 1.0
+            cell_w = choose_cell_width(n, self.n_slab, eta_span,
+                                       self.max_distance,
+                                       target_rows=self.TARGET_RING0_ROWS)
+        self.cell_w = float(cell_w)
+        self.n_phi = max(1, int(math.ceil(_TWO_PI / self.cell_w)))
         self.phi_w = _TWO_PI / self.n_phi
         self.eta_lo = float(self.eta.min()) if n else 0.0
         eta_hi = float(self.eta.max()) if n else 0.0
-        self.eta_w = w
-        self.n_eta = max(1, int(math.floor((eta_hi - self.eta_lo) / w)) + 1)
+        self.n_eta = max(1, int(math.ceil((eta_hi - self.eta_lo) / self.cell_w)) + 1)
+        # rings needed to cover max_distance, +1 so a candidate sitting exactly
+        # at the cut is never missed
+        self.max_ring = int(math.ceil(self.max_distance / self.cell_w)) + 1
 
         phi_c = self._phi_cell(self.dir_phi)
         eta_c = np.clip(self._eta_cell(self.eta), 0, self.n_eta - 1)
@@ -170,8 +216,9 @@ class Grid:
         self.starts = np.zeros(self.n_bucket + 1, dtype=np.int64)
         np.cumsum(counts, out=self.starts[1:])
 
-        # pT-sorted order, for the exact window population count used when a
-        # query fails (never on the success path - it is O(window)).
+        self._ring_offsets = [_ring_offsets(r) for r in range(self.max_ring + 1)]
+
+        # pT-sorted, for the exact window population used only on failure
         self.pt_order = np.argsort(self.pt, kind="stable").astype(np.int64)
         self.pt_sorted = self.pt[self.pt_order]
 
@@ -185,58 +232,65 @@ class Grid:
                 .astype(np.int64) % self.n_phi)
 
     def _eta_cell(self, eta):
-        return np.floor((np.asarray(eta) - self.eta_lo) / self.eta_w).astype(np.int64)
+        return np.floor((np.asarray(eta) - self.eta_lo) / self.cell_w).astype(np.int64)
 
     def window_bounds(self, pt_seed):
         """The hard pT window, exactly as ``library.py`` applies it."""
         return (pt_seed - self.pt_tolerance * pt_seed,
                 pt_seed + self.pt_tolerance * pt_seed)
 
-    def candidates(self, pt_seed, query_phi, target_eta):
-        """Every row that could be within ``max_distance`` of the query.
+    def slab_range(self, pt_seed):
+        """Slabs the pT window can touch - exact, no padding.
 
-        A superset: the exact pT cut and the distance cut are applied by the
-        caller. Exhaustive by the L-infinity argument above.
+        ``floor`` is monotonic, so every pt in [lo, hi] has a slab in
+        [slab(lo), slab(hi)]. Padding this by +-1 would gather ~60% more rows
+        for candidates the exact pT cut then throws away.
         """
         lo, hi = self.window_bounds(pt_seed)
         s0 = int(self._slab_of(np.array([max(lo, 1e-9)]))[0])
         s1 = int(self._slab_of(np.array([max(hi, 1e-9)]))[0])
-        s0 = max(s0 - 1, 0)
-        s1 = min(s1 + 1, self.n_slab - 1)
-        if s1 < s0:
-            return np.empty(0, dtype=np.int64)
+        return max(s0, 0), min(s1, self.n_slab - 1)
 
-        pc = int(self._phi_cell(np.array([query_phi]))[0])
-        ec = int(self._eta_cell(np.array([target_eta]))[0])
-        phi_cells = sorted({(pc + d) % self.n_phi for d in (-1, 0, 1)})
-        eta_cells = [e for e in (ec - 1, ec, ec + 1) if 0 <= e < self.n_eta]
-        if not eta_cells:
-            return np.empty(0, dtype=np.int64)
-
+    def ring(self, s0, s1, phi_c, eta_c, r):
+        """Rows in the cells at Chebyshev distance exactly ``r`` from the query."""
         chunks = []
-        for s in range(s0, s1 + 1):
-            base_s = s * self.n_phi
-            for p in phi_cells:
-                base = (base_s + p) * self.n_eta
-                for e in eta_cells:
-                    b = base + e
-                    a, z = self.starts[b], self.starts[b + 1]
-                    if z > a:
-                        chunks.append(self.rows[a:z])
+        for dphi, deta in self._ring_offsets[r]:
+            e = eta_c + deta
+            if not (0 <= e < self.n_eta):
+                continue
+            p = (phi_c + dphi) % self.n_phi          # phi is periodic
+            base = (p * self.n_eta + e)
+            for sl in range(s0, s1 + 1):
+                b = sl * self.n_phi * self.n_eta + base
+                a, z = self.starts[b], self.starts[b + 1]
+                if z > a:
+                    chunks.append(self.rows[a:z])
         if not chunks:
-            return np.empty(0, dtype=np.int64)
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
         return np.concatenate(chunks)
 
-    def window_population(self, pt_seed):
-        """How many rows lie in the pT window, ignoring availability."""
+    def window_rows(self, pt_seed):
+        """Every row in the pT window, ignoring geometry. Failure path only."""
         lo, hi = self.window_bounds(pt_seed)
         a = int(np.searchsorted(self.pt_sorted, lo, side="left"))
         z = int(np.searchsorted(self.pt_sorted, hi, side="right"))
-        return a, z
-
-    def window_rows(self, pt_seed):
-        a, z = self.window_population(pt_seed)
         return self.pt_order[a:z]
+
+
+def _ring_offsets(r):
+    """(dphi, deta) offsets whose Chebyshev distance is exactly ``r``."""
+    if r == 0:
+        return [(0, 0)]
+    out = []
+    for d in range(-r, r + 1):
+        out.append((d, -r))
+        out.append((d, r))
+    for e in range(-r + 1, r):
+        out.append((-r, e))
+        out.append((r, e))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -317,30 +371,60 @@ class Matcher:
         Pure - mutates nothing. Returns ``(match, distance)`` with ``match=None``
         on failure and ``distance`` the nearest allowed candidate's distance
         (``inf`` when there was none at all).
+
+        Expands the ring search only as far as it must: the moment the best
+        candidate found is within ``r * cell_w``, nothing outside the gathered
+        cells can be closer, so the answer is proven. With a typical match at
+        distance ~0.002 and cells ~0.06 wide, that is almost always ring 0 or 1.
         """
         qphi = self.query_direction(i)
         tgt = self.partner_eta[i]
-        cand = self.grid.candidates(self.pt[i], qphi, tgt)
-        if len(cand) == 0:
-            return None, np.inf
+        pt_i = self.pt[i]
+        key_i = self.event_key[i]
+        g = self.grid
 
-        lo, hi = self.grid.window_bounds(self.pt[i])
-        ok = (self.pt[cand] >= lo) & (self.pt[cand] <= hi)
-        ok &= self.event_key[cand] != self.event_key[i]
-        if respect_availability:
-            ok &= self.available[cand]
-        cand = cand[ok]
-        if len(cand) == 0:
+        lo, hi = g.window_bounds(pt_i)
+        s0, s1 = g.slab_range(pt_i)
+        if s1 < s0:
             return None, np.inf
+        phi_c = int(g._phi_cell(np.array([qphi]))[0])
+        eta_c = int(g._eta_cell(np.array([tgt]))[0])
 
-        d = self.distances(cand, qphi, tgt)
-        # Ties resolve to the lowest row index, matching library.py's chunked
-        # argmin with a strict <.
-        best = cand[np.lexsort((cand, d))[0]]
-        bd = float(d.min())
-        if bd > self.max_distance:
-            return None, bd
-        return int(best), bd
+        best, best_d = -1, np.inf
+        for r in range(g.max_ring + 1):
+            cand = g.ring(s0, s1, phi_c, eta_c, r)
+            if cand is not None and len(cand):
+                ok = (self.pt[cand] >= lo) & (self.pt[cand] <= hi)
+                ok &= self.event_key[cand] != key_i
+                if respect_availability:
+                    ok &= self.available[cand]
+                cand = cand[ok]
+                if len(cand):
+                    d = self.distances(cand, qphi, tgt)
+                    k = int(np.argmin(d))
+                    dk = float(d[k])
+                    if dk < best_d:
+                        # argmin, not a full sort: only the minimum is wanted,
+                        # and ties resolve to the lowest row index to match
+                        # library.py's chunked argmin with a strict <.
+                        tied = cand[d == dk]
+                        best, best_d = int(tied.min()), dk
+                    elif dk == best_d:
+                        best = min(best, int(cand[d == dk].min()))
+
+            # Everything not yet gathered is at least r*cell_w away, so a best
+            # within that is provably the global best.
+            covered = r * g.cell_w
+            if best >= 0 and best_d <= covered:
+                break
+            if covered > self.max_distance:
+                break
+
+        if best < 0:
+            return None, np.inf
+        if best_d > self.max_distance:
+            return None, best_d
+        return best, best_d
 
     def classify_failure(self, i, best_distance):
         """Why seed ``i`` failed, and the numbers that make it interpretable.

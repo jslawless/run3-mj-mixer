@@ -138,7 +138,7 @@ def slice_or_unknown(path, xs_keys):
 # Progress
 # ---------------------------------------------------------------------------
 
-def _progress(iterable, *, total=None, enabled=True, desc=""):
+def _progress(iterable, *, total=None, enabled=True, desc="", unit="file"):
     """``iterable`` wrapped in a progress bar, or a plain counter without tqdm.
 
     The fallback matters: this scan opens every slimmed file over xrootd and
@@ -149,7 +149,7 @@ def _progress(iterable, *, total=None, enabled=True, desc=""):
         return iterable
     try:
         from tqdm import tqdm
-        return tqdm(iterable, total=total, unit="file", desc=desc)
+        return tqdm(iterable, total=total, unit=unit, desc=desc)
     except ImportError:
         pass
 
@@ -161,7 +161,7 @@ def _progress(iterable, *, total=None, enabled=True, desc=""):
             if now - last > 5.0 or i == total:
                 rate = i / max(now - t0, 1e-9)
                 eta = (total - i) / rate if total and rate else 0
-                print(f"  {desc}: {i:,}/{total:,}  {rate:.1f} file/s  "
+                print(f"  {desc}: {i:,}/{total:,}  {rate:.1f} {unit}/s  "
                       f"eta {eta / 60:.1f} min", flush=True)
                 last = now
 
