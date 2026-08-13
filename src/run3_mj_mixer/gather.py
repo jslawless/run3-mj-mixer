@@ -248,7 +248,8 @@ def main(argv=None):
 
     table = ft.load_file_table(args.file_table)
     manifest = load_pair_manifest(args.pairs_dir)
-    paths = {int(r["file_id"]): r["path"] for r in table["files"]}
+    # the URL, not the identity path - a bare /store/... is not openable
+    paths = dict(enumerate(ft.url_by_id(table)))
 
     if args.file_ids:
         owned = [int(x) for x in args.file_ids.split(",") if x.strip()]

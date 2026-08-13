@@ -220,10 +220,32 @@ def build_file_table(paths, *, mode="mc", xs_json=None, workers=1,
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
 
-    norm = [normalize_path(p) for p in paths]
-    if len(set(norm)) != len(norm):
-        dupes = sorted({p for p in norm if norm.count(p) > 1})
-        raise ValueError(f"duplicate input paths after normalization: {dupes}")
+    # A file has TWO path forms and they are not interchangeable:
+    #   path - redirector stripped. Identity only: it is what file_id ordering
+    #          and file_hash are computed from, so the same file is the same
+    #          file whether it was named bare or as a full XRootD URL.
+    #   url  - exactly as given. What you OPEN. On EOS a bare /store/... is not
+    #          a filesystem path, so reading it goes through the redirector.
+    # Stripping the redirector and then handing that to uproot is the bug this
+    # split exists to prevent.
+    url_of = {}
+    for p in paths:
+        n = normalize_path(p)
+        if n in url_of and url_of[n] != str(p):
+            raise ValueError(
+                f"{n} was given twice under different names:\n"
+                f"  {url_of[n]}\n  {p}\nPick one."
+            )
+        url_of[n] = str(p)
+    norm = list(url_of)
+    if len(norm) != len(paths):
+        seen, dupes = set(), []
+        for p in paths:
+            n = normalize_path(p)
+            if n in seen:
+                dupes.append(n)
+            seen.add(n)
+        raise ValueError(f"duplicate input paths after normalization: {sorted(set(dupes))}")
 
     xs, xs_path, keys = None, None, []
     if mode == "mc":
@@ -248,7 +270,9 @@ def build_file_table(paths, *, mode="mc", xs_json=None, workers=1,
 
     if mode == "mc":
         datasets, n_original = scan_n_original(
-            norm, keys, workers=workers, progress=progress)
+            [url_of[n] for n in norm], keys, workers=workers, progress=progress)
+        # re-key from url back to the normalized identity
+        datasets = {normalize_path(u): d for u, d in datasets.items()}
     else:
         datasets = {p: slice_or_unknown(p, keys) for p in norm}
         n_original = {}
@@ -256,10 +280,12 @@ def build_file_table(paths, *, mode="mc", xs_json=None, workers=1,
     for p in new:
         files.append({
             "file_id": next_id,
-            "path": p,
+            "path": p,                  # identity: redirector stripped
+            "url": url_of[p],           # what to open
             "file_hash": file_hash(p),
             "dataset": datasets[p],
-            "n_original_file": (read_cutflow0(p) if mode == "mc" else None),
+            "n_original_file": (read_cutflow0(url_of[p]) if mode == "mc"
+                                else None),
         })
         next_id += 1
 
@@ -345,6 +371,21 @@ def w_rel_by_id(table):
     for rec in table["files"]:
         out[int(rec["file_id"])] = float(
             table["datasets"][rec["dataset"]]["w_rel"])
+    return out
+
+
+def url_by_id(table):
+    """``file_id -> the URL to OPEN``.
+
+    Not ``path``: that is the redirector-stripped identity form, and a bare
+    ``/store/...`` is not a filesystem path on EOS. Everything that reads a
+    slimmed file goes through here. Falls back to ``path`` for a table written
+    before the split, and for genuinely local files where the two are the same.
+    """
+    n = max((int(r["file_id"]) for r in table["files"]), default=-1) + 1
+    out = [None] * n
+    for rec in table["files"]:
+        out[int(rec["file_id"])] = rec.get("url") or rec["path"]
     return out
 
 

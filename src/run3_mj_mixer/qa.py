@@ -148,7 +148,8 @@ def qa_spot(ix, table, n_spot=2000, seed=0, tree_name="events"):
     import uproot
 
     r = Report(f"spot check ({n_spot} rows)")
-    paths = {int(x["file_id"]): x["path"] for x in table["files"]}
+    # the URL, not the identity path - a bare /store/... is not openable
+    paths = dict(enumerate(ft.url_by_id(table)))
     n = len(ix)
     if n == 0:
         r.info("nothing to check", "empty index")
@@ -166,13 +167,20 @@ def qa_spot(ix, table, n_spot=2000, seed=0, tree_name="events"):
 
     for fid, rws in sorted(by_file.items()):
         path = paths.get(fid)
-        if path is None or not os.path.exists(path):
-            missing_files.append(path or f"file_id {fid}")
+        if path is None:
+            missing_files.append(f"file_id {fid}")
             continue
-        with uproot.open(path) as f:
-            t = f[tree_name]
-            a = t.arrays(["ScoutingPFJet_pt", "ScoutingPFJet_eta",
-                          "ScoutingPFJet_phi", "ScoutingPFJet_m"], library="ak")
+        # Try to open rather than stat: os.path.exists is meaningless for a
+        # root:// URL, and an unreachable file is a skip here, not a failure.
+        try:
+            with uproot.open(path) as f:
+                t = f[tree_name]
+                a = t.arrays(["ScoutingPFJet_pt", "ScoutingPFJet_eta",
+                              "ScoutingPFJet_phi", "ScoutingPFJet_m"],
+                             library="ak")
+        except Exception as exc:
+            missing_files.append(f"{path} ({type(exc).__name__})")
+            continue
         for row in rws:
             e = int(ix["entry"][row])
             mask = int(ix["jet_mask"][row])

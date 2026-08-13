@@ -1,8 +1,8 @@
 """condor.py - the shared HTCondor job template.
 
-Stages 1a, 3a and 3b all need the same job wrapper: pick the LCG view matching
-the node's OS, build a venv that inherits its packages, install only our wheel,
-run something, then stage the output to EOS with xrdcp.
+Stages 1a, 3a and 3b all need the same job wrapper: source the pinned LCG view,
+build a venv that inherits its packages, install only our wheel, run something,
+then stage the output to EOS with xrdcp.
 
 That wrapper lives here **once**. The three existing submitters in this
 repository family (mixer, slimmer, evaluator) each carry their own copy and have
@@ -23,15 +23,33 @@ was a bug once:
   to one level where it is missing, which would drop every nested output.
 * ``xrdcp -f -p`` with paths relative to the job dir, so the local directory
   layout is reproduced under the EOS output dir.
+* the DOUBLE slash in ``root://host//store/...`` - one slash is a different path.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import stat
 
-LCG_BASE = "/cvmfs/sft.cern.ch/lcg/views/LCG_106"
+# The pinned environment. ONE constant, used by the job template and quoted by
+# docs/how_to_run.md, so the login node and the workers cannot drift apart.
+#
+# Pinned rather than discovered, deliberately: a fixed view makes a run
+# reproducible months later, and an LCG view being retired or re-pointed is
+# exactly the kind of change that should break loudly at submit time rather than
+# silently alter results.
+#
+# The cost of pinning the PLATFORM (not just the version): the view's binaries are
+# built against that OS's glibc/libstdc++, so this string only works on el9
+# nodes. cmslpc condor defaults to the cms:rhel9 apptainer, so that is the norm -
+# but if jobs start landing on el8, this is the line to change, and
+# `--lcg-view` overrides it without an edit.
+LCG_VERSION = "LCG_106"
+LCG_PLATFORM = "x86_64-el9-gcc13-opt"
+LCG_VIEW = f"/cvmfs/sft.cern.ch/lcg/views/{LCG_VERSION}/{LCG_PLATFORM}"
+
 DEFAULT_REDIRECTOR = "root://cmseos.fnal.gov"
 
 
@@ -80,28 +98,37 @@ pwd
 ls
 echo
 
-## The cvmfs LCG view points LC_* at a UTF-8 locale the minimal cms:rhel9
-## container lacks. Force an always-present one, and re-assert after sourcing
-## the view because the view resets LC_*.
+## CONTAINER-only fix, not needed on a login node: condor runs inside the
+## minimal cms:rhel9 apptainer, which ships almost no locales, and the LCG view
+## sets LC_* to a UTF-8 locale that image lacks - so every tool it runs warns
+## "Setting LC_CTYPE failed, using C". C.UTF-8 is built into glibc on el8/el9, so
+## it is always present. Re-asserted after sourcing the view, which resets LC_*.
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 LC_CTYPE=C.UTF-8
 
-## Pick the view matching this node's OS and the newest gcc available for it.
-LCG_BASE={lcg_base}
-osmaj=$(rpm -E %{{rhel}} 2>/dev/null || echo 9)
-LCG_VIEW=$(ls "$LCG_BASE"/x86_64-el${{osmaj}}-gcc*-opt/setup.sh 2>/dev/null | sort -V | tail -1)
-if [ -z "$LCG_VIEW" ] || [ ! -r "$LCG_VIEW" ]; then
-  LCG_VIEW=$(ls "$LCG_BASE"/x86_64-el*-gcc*-opt/setup.sh 2>/dev/null | sort -V | tail -1)
+## The PINNED LCG view - one constant in condor.py, quoted by the docs, so the
+## login node and the workers cannot drift. Fail fast and loudly: 300 jobs dying
+## on a cryptic import error is far worse than one clear line here.
+LCG_VIEW={lcg_view}
+echo "Node OS major: $(rpm -E %{{rhel}} 2>/dev/null || echo unknown)"
+echo "Pinned LCG view: $LCG_VIEW"
+if [ ! -r "$LCG_VIEW/setup.sh" ]; then
+  echo "ERROR: $LCG_VIEW/setup.sh is not readable." >&2
+  echo "  Either cvmfs is not mounted on this node, or the pinned view has" >&2
+  echo "  moved. Available builds of this version:" >&2
+  ls -d "$(dirname "$LCG_VIEW")"/x86_64-el*-gcc*-opt 2>/dev/null >&2 \
+    || echo "    (none - the whole version is gone)" >&2
+  echo "  Change LCG_VERSION / LCG_PLATFORM in src/run3_mj_mixer/condor.py," >&2
+  echo "  or pass --lcg-view to the submitter." >&2
+  exit 1
 fi
-echo "Node OS major: $osmaj"
-echo "Sourcing LCG view: $LCG_VIEW"
-source "$LCG_VIEW"
+source "$LCG_VIEW/setup.sh"
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 LC_CTYPE=C.UTF-8
 echo "Base python: $(python3 --version)"
 
 ## A venv that INHERITS the view's packages; install ONLY our wheel, no deps.
 ## Do NOT unset PYTHONPATH - that is how the view exposes uproot/awkward.
-python3 -m venv --system-site-packages .venv
-source .venv/bin/activate
+python3 -m venv --system-site-packages pkg-env
+source pkg-env/bin/activate
 pip install --quiet --no-deps {wheel}
 echo "uproot: $(python3 -c 'import uproot; print(uproot.__version__)')"
 
@@ -163,9 +190,9 @@ def eos_url(eosoutdir, redirector=DEFAULT_REDIRECTOR):
 
 
 def job_script(run_commands, eosoutdir, wheel, *,
-               redirector=DEFAULT_REDIRECTOR, lcg_base=LCG_BASE):
+               redirector=DEFAULT_REDIRECTOR, lcg_view=LCG_VIEW):
     """The per-job .sh: environment, the work, then delivery to EOS."""
-    head = _HEAD.format(lcg_base=lcg_base, wheel=os.path.basename(wheel),
+    head = _HEAD.format(lcg_view=lcg_view, wheel=os.path.basename(wheel),
                         run_commands=run_commands)
     deliver = _DELIVER.replace("{eos_url}", eos_url(eosoutdir, redirector))
     return head + deliver
@@ -173,7 +200,8 @@ def job_script(run_commands, eosoutdir, wheel, *,
 
 def write_jobs(logdir, jobs, transfer, eosoutdir, wheel, *, cpu=1,
                queue="tomorrow", ram="4GB", disk="4GB",
-               redirector=DEFAULT_REDIRECTOR, submit_name="submit.sub"):
+               redirector=DEFAULT_REDIRECTOR, lcg_view=LCG_VIEW,
+               submit_name="submit.sub"):
     """Write one .sh per job plus the .sub. Returns the .sub path.
 
     ``jobs`` maps job name -> the shell commands that job should run.
@@ -182,7 +210,8 @@ def write_jobs(logdir, jobs, transfer, eosoutdir, wheel, *, cpu=1,
     for name, cmds in jobs.items():
         path = os.path.join(str(logdir), f"{name}.sh")
         with open(path, "w") as f:
-            f.write(job_script(cmds, eosoutdir, wheel, redirector=redirector))
+            f.write(job_script(cmds, eosoutdir, wheel, redirector=redirector,
+                               lcg_view=lcg_view))
         os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP
                  | stat.S_IXOTH)
     sub = os.path.join(str(logdir), submit_name)
@@ -215,15 +244,30 @@ def add_common_args(p, *, ram="4GB", disk="4GB"):
     p.add_argument("--memory", default=ram)
     p.add_argument("--disk", default=disk)
     p.add_argument("--redirector", default=DEFAULT_REDIRECTOR)
+    p.add_argument("--lcg-view", default=LCG_VIEW,
+                   help=f"pinned LCG view (default {LCG_VIEW}); override without "
+                        "editing the source if nodes move OS")
     p.add_argument("--exec", dest="do_exec", action="store_true",
                    help="run condor_submit instead of only writing the files")
     return p
 
 
-def maybe_submit(sub_path, do_exec):
-    print(f"wrote {sub_path}")
-    if not do_exec:
-        print(f"  (dry run; submit with: condor_submit {sub_path})")
-        return 0
+def submit(sub_path):
+    """Run condor_submit on a .sub file. Returns its exit code.
+
+    Through a shell, not a direct exec: ``subprocess`` execs the file itself, so
+    it dies with ENOEXEC ("Exec format error") on a shell function, an alias, or
+    a wrapper with no ``#!``. The shell handles all three and does the PATH
+    search for us - the same reason the filelist scripts call the ``eos`` binary
+    rather than the ``eosls`` shell function.
+    """
     import subprocess
-    return subprocess.call(["condor_submit", sub_path])
+
+    cmd = f"condor_submit {shlex.quote(str(sub_path))}"
+    rc = subprocess.call(["bash", "-lc", cmd])
+    if rc != 0:
+        # The .sub file is written and complete, so say that submission failed
+        # rather than leaving it looking like the jobs were never generated.
+        print(f"  submit failed (exit {rc}); the job files are fine - "
+              f"run it yourself:\n      {cmd}")
+    return rc

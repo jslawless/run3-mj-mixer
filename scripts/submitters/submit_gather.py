@@ -17,6 +17,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -38,10 +39,15 @@ def main(argv=None):
     p.add_argument("-t", "--file-table", required=True)
     p.add_argument("--config", default=None,
                    help="mixer config, for payload.jet_branches")
-    p.add_argument("-P", "--n-jobs", type=int, default=60,
-                   help="number of gather jobs; each owns a contiguous block "
-                        "of file_ids")
-    p.add_argument("--tree", default="events")
+    p.add_argument("-P", "--n-jobs", type=int, default=60, metavar="P",
+                   help="number of gather jobs; each owns a contiguous block of "
+                        "file_ids (default 60). Stage 3b must use the SAME value, "
+                        "because it reconstructs leg filenames as "
+                        "legA_<job>_<chunk>.root over range(P) - so this is "
+                        "recorded in <logdir>/gather_manifest.json and read back "
+                        "by submit_assemble.py rather than retyped.")
+    p.add_argument("--tree", default="events",
+                   help="tree name in the slimmed files")
     condor.add_common_args(p, ram="4GB", disk="4GB")
     args = p.parse_args(argv)
 
@@ -65,11 +71,27 @@ def main(argv=None):
     sub = condor.write_jobs(args.logdir, jobs, transfer, args.eosoutdir,
                             args.wheel, cpu=args.cpu, queue=args.queue,
                             ram=args.memory, disk=args.disk,
-                            redirector=args.redirector)
+                            redirector=args.redirector,
+                            lcg_view=args.lcg_view)
+    # Record P so stage 3b does not have to be told again. Written at submit
+    # time, not by the jobs: N parallel jobs cannot safely share one manifest.
+    man = {"schema": "run3-mj-gather-submit", "n_jobs": n_jobs,
+           "legs_subdir": LEGS_SUBDIR, "pairs_dir": args.pairs_dir,
+           "eosoutdir": args.eosoutdir}
+    man_path = os.path.join(args.logdir, "gather_manifest.json")
+    with open(man_path, "w") as f:
+        json.dump(man, f, indent=2)
+        f.write("\n")
+
     print(f"{n_files} file(s) -> {n_jobs} gather job(s), "
           f"~{-(-n_files // n_jobs)} file(s) each")
+    print(f"recorded P={n_jobs} in {man_path} (stage 3b reads it)")
     print(f"outputs land under {args.eosoutdir}/{LEGS_SUBDIR}/")
-    return condor.maybe_submit(sub, args.do_exec)
+    print(f"wrote {sub}")
+    if not args.do_exec:
+        print(f"  dry run; submit with: condor_submit {sub}")
+        return 0
+    return condor.submit(sub)
 
 
 if __name__ == "__main__":

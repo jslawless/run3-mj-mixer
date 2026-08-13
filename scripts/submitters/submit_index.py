@@ -65,7 +65,16 @@ def main(argv=None):
     p.add_argument("--config", required=True)
     p.add_argument("--xs-json", default=None,
                    help="only used to name output subdirectories by slice")
-    p.add_argument("-n", "--nfPerJob", type=int, default=20)
+    p.add_argument("-n", "--nfPerJob", type=int, default=20, metavar="N",
+                   help="input files per CONDOR JOB (default 20). Not files per "
+                        "output: stage 1a writes one shard per input file "
+                        "regardless, so -n 20 means one job that produces 20 "
+                        "shards. Tunes job granularity only - each job pays a "
+                        "fixed setup cost (source the LCG view, build the venv, "
+                        "install the wheel), so -n 1 would spend most of its "
+                        "wall time on setup, while a large -n makes a single "
+                        "failure re-do that many files. Jobs never mix slices, "
+                        "so the real job count rounds up per slice.")
     p.add_argument("--tree", default="events")
     p.add_argument("--index-n-jets", type=int, default=3)
     condor.add_common_args(p, ram="3GB", disk="3GB")
@@ -95,7 +104,8 @@ def main(argv=None):
     sub = condor.write_jobs(args.logdir, jobs, transfer, args.eosoutdir,
                             args.wheel, cpu=args.cpu, queue=args.queue,
                             ram=args.memory, disk=args.disk,
-                            redirector=args.redirector)
+                            redirector=args.redirector,
+                            lcg_view=args.lcg_view)
 
     n_unknown = sum(len(fs) for sl, fs in groups.values() if sl == UNKNOWN_SLICE)
     print(f"{len(files)} file(s) -> {len(jobs)} job(s), "
@@ -104,7 +114,11 @@ def main(argv=None):
         print(f"  note: {n_unknown} file(s) matched no slice and go to "
               f"{SHARD_SUBDIR}/{UNKNOWN_SLICE}/")
     print(f"outputs land under {args.eosoutdir}/{SHARD_SUBDIR}/<slice>/")
-    return condor.maybe_submit(sub, args.do_exec)
+    print(f"wrote {sub}")
+    if not args.do_exec:
+        print(f"  dry run; submit with: condor_submit {sub}")
+        return 0
+    return condor.submit(sub)
 
 
 if __name__ == "__main__":

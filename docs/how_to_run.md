@@ -39,26 +39,34 @@ uproot/awkward/numpy/boost-histogram. Use the same LCG view the condor jobs use,
 and install this package with **`--no-deps`** — pulling PyPI wheels risks an
 ABI mismatch against the view's libstdc++.
 
+**The view is pinned**, so a run stays reproducible and a retired view breaks
+loudly instead of quietly changing results. The value below is the same constant
+the condor jobs use — `LCG_VERSION` / `LCG_PLATFORM` in
+`src/run3_mj_mixer/condor.py`. Change it in one place and both follow.
+
 ```bash
-source /cvmfs/sft.cern.ch/lcg/views/LCG_106/x86_64-el9-gcc13-opt/setup.sh
-export LC_ALL=C.UTF-8 LANG=C.UTF-8 LC_CTYPE=C.UTF-8
-python3 -m venv --system-site-packages .venv
-source .venv/bin/activate
+export LCG_VIEW=/cvmfs/sft.cern.ch/lcg/views/LCG_106/x86_64-el9-gcc13-opt
+source $LCG_VIEW/setup.sh
+
+python3 -m venv --system-site-packages pkg-env
+source pkg-env/bin/activate
 pip install --no-deps -e .
-python3 -c "import uproot; print('uproot', uproot.__version__)"
 ```
 
 ## 3. Proxy and wheel
 
 ```bash
 voms-proxy-init --rfc --voms cms -valid 192:00
+
+rm -f run3_mj_mixer-*.whl      # pip wheel does not clean up old builds
 pip wheel . -w .
-export WHEEL=$PWD/$(ls run3_mj_mixer-*.whl | head -1)
+ls run3_mj_mixer-*.whl         # expect exactly one
+
+export WHEEL=$PWD/$(ls run3_mj_mixer-*.whl)
 export OUT=/store/user/$USER/mixing
 ```
 
-**Rebuild the wheel after any source change** — condor installs from it, not from
-your checkout.
+**Rebuild the wheel after any source change**
 
 ## 4. List the slimmed inputs
 
@@ -67,11 +75,7 @@ python scripts/submitters/make_eos_filelists.py \
     --host cmseos.fnal.gov \
     --base /store/user/$USER/slimmed \
     -o filelists/
-ls filelists/
 ```
-
-One JSON per slice, holding full `root://cmseos.fnal.gov//store/...` URLs. Both
-the submitter and the file table read this directory directly.
 
 ## 5. Stage 1a — index shards (condor)
 
@@ -86,11 +90,24 @@ condor_q
 
 Omit `--exec` the first time and read `batch_index/submit.sub` plus one `.sh`.
 
-Each job writes one shard per file to `$OUT/index/<slice>/hindex_*.root`, ~65
-bytes per hemisphere. It does **not** copy the event data — that stays in the
-slimmed files and is looked up in 3a. Files are grouped by slice for read
-locality; they no longer need to be representative samples, which was only
-required when each job built its own private library.
+`-n 20` is **input files per condor job**, not files per output. Stage 1a always
+writes one shard per input file, so `-n 20` means one job that runs
+`run3-mj-index` twenty times and produces twenty shards. It tunes job granularity
+only:
+
+- each job pays a fixed setup cost — source the LCG view, build the venv, install
+  the wheel — so `-n 1` would spend most of its wall time on setup and queue
+  ~5,800 jobs;
+- a large `-n` means fewer, longer jobs, but a single failure re-does that many
+  files;
+- jobs never mix slices, so the real count rounds up per slice (with 11 slices,
+  a few more jobs than `n_files / 20`).
+
+Each shard is ~65 bytes per hemisphere and lands in
+`$OUT/index/<slice>/hindex_*.root`. Stage 1a does **not** copy the event data —
+that stays in the slimmed files and is looked up in 3a. Files are grouped by slice
+for read locality; they no longer need to be representative samples, which was
+only required when each job built its own private library.
 
 A slimmed file that passes no events still yields a **0-row shard with a
 completion marker**, so a missing shard is unambiguously a failed job.
@@ -195,8 +212,17 @@ python scripts/submitters/submit_assemble.py \
     -t file_table.json -o $OUT \
     --config config/config.json --wheel $WHEEL \
     --manifest pairs/pairs_manifest.json \
-    -P $NP --logdir batch_assemble --exec
+    --gather-manifest batch_gather/gather_manifest.json \
+    --logdir batch_assemble --exec
 ```
+
+**No `-P` here.** The number of gather jobs must match stage 3a exactly — leg
+filenames are reconstructed as `legA_<job>_<chunk>.root` over `range(P)`, so too
+small silently misses shards that exist on disk, and too large references files
+that never existed. `submit_gather.py` records the value it actually used in
+`batch_gather/gather_manifest.json` and this reads it back. That matters because
+gather clamps `P` to the file count, so the number it used may differ from the
+number you asked for.
 
 One job per pair chunk: read the chunk plus its leg shards, join on
 `(pair_id, leg)`, write `$OUT/stitched/stitched_*.root`.
@@ -213,7 +239,8 @@ in the pair manifest and each output's `sum_xs_weight`.
 
 ```bash
 python scripts/monitors/check_stage_outputs.py legs \
-    -p pairs/ -d /eos/uscms$OUT/legs -P $NP
+    -p pairs/ -d /eos/uscms$OUT/legs \
+    --gather-manifest batch_gather/gather_manifest.json
 python scripts/monitors/check_stage_outputs.py stitched \
     -p pairs/ -d /eos/uscms$OUT/stitched
 ```

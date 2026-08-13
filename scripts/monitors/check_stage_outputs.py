@@ -71,12 +71,24 @@ def main(argv=None):
     p.add_argument("stage", choices=["legs", "stitched"])
     p.add_argument("-p", "--pairs-dir", required=True)
     p.add_argument("-d", "--dir", required=True, help="the stage's output dir")
-    p.add_argument("-P", "--n-gather-jobs", type=int, default=60)
+    p.add_argument("-P", "--n-gather-jobs", type=int, default=None, metavar="P",
+                   help="how many gather jobs ran; needed to know which leg files "
+                        "to expect. Read from --gather-manifest when omitted.")
+    p.add_argument("--gather-manifest", default="batch_gather/gather_manifest.json",
+                   metavar="JSON", help="the manifest submit_gather.py wrote")
     args = p.parse_args(argv)
 
     manifest = load_manifest(args.pairs_dir)
+    n_gather = args.n_gather_jobs
+    if args.stage == "legs" and n_gather is None:
+        try:
+            with open(args.gather_manifest) as f:
+                n_gather = int(json.load(f)["n_jobs"])
+        except (OSError, KeyError, ValueError) as exc:
+            sys.exit(f"could not read P from {args.gather_manifest} ({exc}); "
+                     "pass -P explicitly with the value stage 3a used.")
     if args.stage == "legs":
-        bad, total = check_legs(manifest, args.dir, args.n_gather_jobs)
+        bad, total = check_legs(manifest, args.dir, n_gather)
         bad = [(b, "absent") for b in bad]
     else:
         bad, total = check_stitched(manifest, args.dir)

@@ -45,9 +45,17 @@ def main(argv=None):
     p.add_argument("-l", "--legs-dir", required=True)
     p.add_argument("-t", "--file-table", required=True)
     p.add_argument("--config", default=None)
-    p.add_argument("-P", "--n-gather-jobs", type=int, default=60,
-                   help="how many gather jobs ran; sets how many leg shards "
-                        "each chunk expects")
+    p.add_argument("-P", "--n-gather-jobs", type=int, default=None, metavar="P",
+                   help="how many gather jobs ran. MUST match stage 3a: leg "
+                        "filenames are reconstructed as legA_<job>_<chunk>.root "
+                        "over range(P), so too small silently misses shards that "
+                        "exist and too large references files that do not. "
+                        "Normally omitted - it is read from "
+                        "--gather-manifest instead.")
+    p.add_argument("--gather-manifest", default="batch_gather/gather_manifest.json",
+                   metavar="JSON",
+                   help="the manifest submit_gather.py wrote, which records P "
+                        "(default batch_gather/gather_manifest.json)")
     p.add_argument("--manifest", default=None,
                    help="local copy of pairs_manifest.json (default: read from "
                         "--pairs-dir)")
@@ -60,6 +68,18 @@ def main(argv=None):
     if not chunks:
         sys.exit("the pair manifest lists no chunks")
 
+    # P must equal what stage 3a used. Prefer the recorded value over a retyped
+    # flag: a mismatch fails in a way that looks like missing gather output.
+    n_gather = args.n_gather_jobs
+    if n_gather is None:
+        try:
+            with open(args.gather_manifest) as f:
+                n_gather = int(json.load(f)["n_jobs"])
+            print(f"read P={n_gather} from {args.gather_manifest}")
+        except (OSError, KeyError, ValueError) as exc:
+            sys.exit(f"could not read P from {args.gather_manifest} ({exc}); "
+                     "pass -P explicitly with the value stage 3a used.")
+
     ft_base = os.path.basename(args.file_table)
     cfg_base = os.path.basename(args.config) if args.config else None
 
@@ -68,7 +88,7 @@ def main(argv=None):
         cid = int(c["chunk_id"])
         legs = " ".join(
             f"{args.legs_dir}/legA_{j:04d}_{cid:05d}.root"
-            for j in range(args.n_gather_jobs))
+            for j in range(n_gather))
         out = f"{STITCHED_SUBDIR}/stitched_{cid:05d}.root"
         cmd = (f"run3-mj-assemble {args.pairs_dir}/{c['file']} {legs} "
                f"-t {ft_base} -o {out} "
@@ -81,11 +101,16 @@ def main(argv=None):
     sub = condor.write_jobs(args.logdir, jobs, transfer, args.eosoutdir,
                             args.wheel, cpu=args.cpu, queue=args.queue,
                             ram=args.memory, disk=args.disk,
-                            redirector=args.redirector)
+                            redirector=args.redirector,
+                            lcg_view=args.lcg_view)
     print(f"{len(chunks)} chunk(s) -> {len(jobs)} assemble job(s)")
-    print(f"each expects {args.n_gather_jobs} leg shard(s) from {args.legs_dir}")
+    print(f"each expects {n_gather} leg shard(s) from {args.legs_dir}")
     print(f"outputs land under {args.eosoutdir}/{STITCHED_SUBDIR}/")
-    return condor.maybe_submit(sub, args.do_exec)
+    print(f"wrote {sub}")
+    if not args.do_exec:
+        print(f"  dry run; submit with: condor_submit {sub}")
+        return 0
+    return condor.submit(sub)
 
 
 if __name__ == "__main__":
