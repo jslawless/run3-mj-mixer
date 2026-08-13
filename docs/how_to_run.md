@@ -282,8 +282,14 @@ Stage 1a also takes `--by-slice`, which colours each job by the HT slice of its
 input files and prints the per-slice table:
 
 ```bash
-python scripts/monitors/plot_index_jobs.py batch_index --by-slice
+python scripts/monitors/plot_index_jobs.py batch_index --by-slice --logx
 ```
+
+`--logx` is worth adding whenever the low-HT slices are in the submission:
+almost nothing there survives the jet cut, so those jobs read a few dozen
+events while the high-HT ones read hundreds of thousands, and on a linear axis
+they all pile against the left edge. `--logy` exists but is rarely wanted —
+within one submission wall time and peak memory span well under a decade.
 
 The slices span orders of magnitude in events per file, so this is what
 separates "that job was slow" from "that slice is big". The shading is an

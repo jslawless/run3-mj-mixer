@@ -75,10 +75,11 @@ THEME = {
              "series": ("#3987e5", "#d95926", "#199e70")},
 }
 
-# The blue ramp, for ordinal groups. Light mode runs 250 -> 700 and dark mode
-# 600 -> 100: in both, later groups sit further from the surface, so the step
-# nearest it still clears the 2:1 floor (2.06:1 on light, 2.15:1 on dark).
-# Steps are sampled evenly across the range for the number of groups present.
+# The blue ramp's named steps, for ordinal groups. Light mode runs 250 -> 700
+# and dark mode 600 -> 100: in both, later groups sit further from the surface,
+# so the step nearest it still clears the 2:1 floor (2.06:1 on light, 2.15:1 on
+# dark). More groups than named steps are served by interpolating between them,
+# never by cycling or by borrowing another hue.
 RAMP = {
     "light": ("#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6",
               "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"),
@@ -87,23 +88,63 @@ RAMP = {
              "#cde2fb"),
 }
 
+#: Shades closer than this in OKLab lightness (x100) cannot be told apart, so
+#: the run says so rather than implying the figure is readable.
+READABLE_SEPARATION = 4.0
+
+_TO_LMS = np.array([[0.4122214708, 0.5363325363, 0.0514459929],
+                    [0.2119034982, 0.6806995451, 0.1073969566],
+                    [0.0883024619, 0.2817188376, 0.6299787005]])
+_TO_LAB = np.array([[0.2104542553, 0.7936177850, -0.0040720468],
+                    [1.9779984951, -2.4285922050, 0.4505937099],
+                    [0.0259040371, 0.7827717662, -0.8086757660]])
+
+
+def _oklab(hex_):
+    c = np.array([int(hex_.lstrip("#")[i:i + 2], 16) / 255 for i in (0, 2, 4)])
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    return _TO_LAB @ np.cbrt(_TO_LMS @ lin)
+
+
+def _hex(lab):
+    lin = np.linalg.solve(_TO_LMS, np.linalg.solve(_TO_LAB, lab) ** 3)
+    lin = np.clip(lin, 0, 1)
+    s = np.where(lin <= 0.0031308, lin * 12.92,
+                 1.055 * lin ** (1 / 2.4) - 0.055)
+    return "#" + "".join(f"{int(round(v * 255)):02x}" for v in s)
+
+
+def _ramp_lab(n, theme):
+    """`n` points evenly spaced along the ramp, in OKLab.
+
+    Interpolating rather than picking nearest named steps matters once the
+    group count stops dividing the ramp: choosing 11 of 19 half-steps leaves
+    some neighbours 2.2 apart in lightness and others 4.5, so the shading stops
+    reading as even progress. Interpolated, the gaps agree to a few percent -
+    the named steps are themselves 4.6 to 5.0 apart, and staying on them at
+    whole-step counts is worth more than making that residue exactly zero. At
+    exactly as many groups as named steps the positions land back on them.
+    """
+    lab = np.array([_oklab(h) for h in RAMP[theme]])
+    if n == 1:
+        return lab[len(lab) // 2:len(lab) // 2 + 1]
+    pos = np.linspace(0, len(lab) - 1, n)
+    lo = np.floor(pos).astype(int)
+    hi = np.minimum(lo + 1, len(lab) - 1)
+    frac = (pos - lo)[:, None]
+    return lab[lo] * (1 - frac) + lab[hi] * frac
+
 
 def ramp_colours(n, theme):
-    """`n` steps spread across the ramp, in group order.
+    """`n` shades spread across the ramp, in group order."""
+    return [_hex(v) for v in _ramp_lab(n, theme)]
 
-    Past the ramp's length this raises rather than cycling or generating a
-    hue: a repeated colour would silently claim two groups are one.
-    """
-    steps = RAMP[theme]
-    if n > len(steps):
-        raise SystemExit(
-            f"{n} groups is more than the {len(steps)}-step ramp holds. "
-            "Colouring would have to repeat a shade, which reads as two "
-            "groups being the same one.")
-    if n == 1:
-        return [steps[len(steps) // 2]]
-    idx = np.round(np.linspace(0, len(steps) - 1, n)).astype(int)
-    return [steps[i] for i in idx]
+
+def ramp_separation(n, theme):
+    """Smallest lightness gap between neighbouring shades, OKLab x100."""
+    if n < 2:
+        return np.inf
+    return float(np.min(np.abs(np.diff(_ramp_lab(n, theme)[:, 0])))) * 100
 
 
 def group_colours(groups, theme, neutral=()):
@@ -270,6 +311,29 @@ def summarize(rows, name, met):
     return "   ".join(parts)
 
 
+def _scale(ax, which, log, values, origin, comma, n_ticks):
+    """One axis: scale, limits and tick labels that can be read.
+
+    A log axis over less than two decades - peak memory across one submission
+    is 85 to 90 MB - gets plain numbers, because matplotlib's default there is
+    scientific notation on the minor ticks and "9 x 10^1" for 90.
+    """
+    axis, set_scale, set_lim = (
+        (ax.xaxis, ax.set_xscale, ax.set_xlim) if which == "x"
+        else (ax.yaxis, ax.set_yscale, ax.set_ylim))
+    if log:
+        set_scale("log")
+        lo, hi = ax.get_xlim() if which == "x" else ax.get_ylim()
+        if lo > 0 and np.log10(hi / lo) < 2:
+            axis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+            axis.set_minor_formatter(matplotlib.ticker.ScalarFormatter())
+        return
+    set_lim(*_span(values, origin))
+    axis.set_major_formatter(comma)
+    # Six-figure counts collide at matplotlib's default tick density.
+    axis.set_major_locator(matplotlib.ticker.MaxNLocator(n_ticks))
+
+
 def summarize_groups(runs, met, grouper):
     """A per-group table, printed whenever colouring by group.
 
@@ -303,8 +367,8 @@ def group_order(runs, grouper):
     return sorted((g for g in seen if g is not None), key=grouper.order)
 
 
-def draw(fig, runs, met, stage, theme, logxy=False, origin=False, groups=None,
-         group_label=None):
+def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
+         groups=None, group_label=None):
     """`runs` is [(name, rows), ...] - several are overlaid for comparison.
 
     `groups`, when given, is [(label, colour), ...] in group order; points are
@@ -361,17 +425,9 @@ def draw(fig, runs, met, stage, theme, logxy=False, origin=False, groups=None,
         # out from under the data.
         xa = np.concatenate(seen_x) if seen_x else np.array([])
         ya = np.concatenate(seen_y) if seen_y else np.array([])
-        if logxy:
-            ax.set_xscale("log")
-            ax.set_yscale("log")
-        elif xa.size:
-            ax.set_xlim(*_span(xa, origin))
-            ax.set_ylim(*_span(ya, origin))
-            ax.xaxis.set_major_formatter(comma)
-            ax.yaxis.set_major_formatter(comma)
-            # Six-figure counts collide at matplotlib's default tick density.
-            ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(5))
-            ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(6))
+        if xa.size:
+            _scale(ax, "x", logx, xa, origin, comma, 5)
+            _scale(ax, "y", logy, ya, origin, comma, 6)
 
         ax.grid(True, color=t["grid"], lw=0.8, alpha=0.9)
         ax.set_axisbelow(True)
@@ -461,8 +517,17 @@ def run_cli(stage, metrics, doc, grouper=None, argv=None):
     p.add_argument("--csv", default=None,
                    help="also dump the joined per-job table")
     p.add_argument("--dark", action="store_true")
-    p.add_argument("--log", dest="logxy", action="store_true",
-                   help="log both axes; useful when job sizes span decades")
+    p.add_argument("--logx", action="store_true",
+                   help="log the work axis. Worth it when job sizes span "
+                        "decades, which they do whenever low-HT slices are "
+                        "included: almost nothing there survives the jet cut, "
+                        "so those jobs read a few dozen events while the "
+                        "high-HT ones read hundreds of thousands.")
+    p.add_argument("--logy", action="store_true",
+                   help="log the cost axes. Rarely wanted - within one "
+                        "submission wall time and peak memory span well under "
+                        "a decade, and a log axis there only compresses the "
+                        "spread you are looking for.")
     p.add_argument("--origin", action="store_true",
                    help="include (0, 0) on every panel. Off by default: one "
                         "submission's jobs are near-identical in size, so this "
@@ -500,6 +565,14 @@ def run_cli(stage, metrics, doc, grouper=None, argv=None):
     groups = None
     if by_group:
         print(summarize_groups(runs, met, grouper))
+        n_shaded = sum(1 for g in group_order(runs, grouper)
+                       if g not in grouper.neutral)
+        gap = ramp_separation(n_shaded, "dark" if args.dark else "light")
+        if gap < READABLE_SEPARATION:
+            print(f"note: {n_shaded} shaded groups leaves neighbouring shades "
+                  f"{gap:.1f} apart in lightness (readable is about "
+                  f"{READABLE_SEPARATION:.0f}+); adjacent {grouper.label}s "
+                  "will not be separable by eye - read the table above.")
 
     if args.csv:
         write_csv(args.csv, runs)
@@ -513,8 +586,9 @@ def run_cli(stage, metrics, doc, grouper=None, argv=None):
         groups = group_colours(group_order(runs, grouper), theme,
                                grouper.neutral)
     fig = plt.figure(figsize=(13.5, 4.4))
-    draw(fig, runs, met, stage, theme, logxy=args.logxy, origin=args.origin,
-         groups=groups, group_label=grouper.label if by_group else None)
+    draw(fig, runs, met, stage, theme, logx=args.logx, logy=args.logy,
+         origin=args.origin, groups=groups,
+         group_label=grouper.label if by_group else None)
     if args.output:
         fig.savefig(args.output, dpi=args.dpi,
                     facecolor=THEME[theme]["surface"])
