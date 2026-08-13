@@ -253,6 +253,12 @@ def main(argv=None):
                    help="explicit comma-separated file_ids instead of --job/--n-jobs")
     p.add_argument("--config", default=None, help="mixer config, for payload.jet_branches")
     p.add_argument("--tree", default="events")
+    p.add_argument("--manifest", default=None, metavar="JSON",
+                   help="local pairs_manifest.json. Condor transfers it "
+                        "into the job because --pairs-dir may be a "
+                        "root:// URL and plain JSON reads cannot open "
+                        "one; the pair CHUNKS are read with uproot, "
+                        "which speaks xrootd.")
     p.add_argument("--progress", action="store_true")
     args = p.parse_args(argv)
 
