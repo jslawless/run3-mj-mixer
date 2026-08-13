@@ -69,9 +69,28 @@ def payload_branches(config=None):
 # Which legs does this job owe?
 # ---------------------------------------------------------------------------
 
-def load_pair_manifest(pairs_dir):
-    with open(os.path.join(str(pairs_dir), M.MANIFEST_NAME)) as f:
-        return json.load(f)
+def load_pair_manifest(pairs_dir, manifest=None):
+    """The pair manifest, from a local copy or from ``pairs_dir``.
+
+    The pair CHUNKS live on EOS and are read with uproot, which speaks xrootd.
+    The manifest is plain JSON read with the stdlib, which does not - so under
+    condor it is transferred into the job like the file table and read by
+    basename. Passing a ``root://`` directory here would fail on ``open()``.
+    """
+    if manifest:
+        return json.load(open(manifest))
+    local = os.path.basename(M.MANIFEST_NAME)
+    if os.path.exists(local):
+        return json.load(open(local))
+    path = os.path.join(str(pairs_dir), M.MANIFEST_NAME)
+    if str(path).startswith("root://"):
+        raise SystemExit(
+            f"cannot read {path} - the manifest is plain JSON and open() does "
+            "not speak xrootd. Transfer it into the job and pass --manifest "
+            "(scripts/submitters/submit_gather.py does this), or point "
+            "--pairs-dir at a local copy."
+        )
+    return json.load(open(path))
 
 
 def chunk_of_pair(manifest):
@@ -247,7 +266,7 @@ def main(argv=None):
         sys.exit(f"gather: {exc}")
 
     table = ft.load_file_table(args.file_table)
-    manifest = load_pair_manifest(args.pairs_dir)
+    manifest = load_pair_manifest(args.pairs_dir, args.manifest)
     # the URL, not the identity path - a bare /store/... is not openable
     paths = dict(enumerate(ft.url_by_id(table)))
 

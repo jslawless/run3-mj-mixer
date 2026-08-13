@@ -39,6 +39,12 @@ def main(argv=None):
     p.add_argument("-t", "--file-table", required=True)
     p.add_argument("--config", default=None,
                    help="mixer config, for payload.jet_branches")
+    p.add_argument("--manifest", default=None, metavar="JSON",
+                   help="local pairs_manifest.json to transfer into the jobs "
+                        "(default <pairs-dir>/pairs_manifest.json when that is "
+                        "a local path). The jobs read the pair CHUNKS from EOS "
+                        "over xrootd, but the manifest is plain JSON and must "
+                        "be transferred.")
     p.add_argument("-P", "--n-jobs", type=int, default=60, metavar="P",
                    help="number of gather jobs; each owns a contiguous block of "
                         "file_ids (default 60). Stage 3b must use the SAME value, "
@@ -51,23 +57,37 @@ def main(argv=None):
     condor.add_common_args(p, ram="4GB", disk="4GB")
     args = p.parse_args(argv)
 
+    # The manifest has to reach the worker as a real file.
+    manifest = args.manifest
+    if manifest is None:
+        guess = os.path.join(args.pairs_dir, "pairs_manifest.json")
+        if not args.pairs_dir.startswith("root://") and os.path.exists(guess):
+            manifest = guess
+    if manifest is None or not os.path.exists(manifest):
+        sys.exit(
+            "need a local pairs_manifest.json to transfer into the jobs; pass "
+            "--manifest <path>. (--pairs-dir may be a root:// URL for the "
+            "chunks, but plain JSON cannot be read over xrootd.)")
+
     table = load_file_table(args.file_table)
     n_files = int(table["n_files"])
     n_jobs = max(1, min(args.n_jobs, n_files))
 
     ft_base = os.path.basename(args.file_table)
     cfg_base = os.path.basename(args.config) if args.config else None
+    man_base = os.path.basename(manifest)
 
     jobs = {}
     for j in range(n_jobs):
         cmd = (f"run3-mj-gather {args.pairs_dir} -t {ft_base} "
                f"-o {LEGS_SUBDIR} --job {j} --n-jobs {n_jobs} "
-               f"--tree {args.tree}")
+               f"--tree {args.tree} --manifest {man_base}")
         if cfg_base:
             cmd += f" --config {cfg_base}"
         jobs[f"gather_{j:04d}"] = f"mkdir -p {LEGS_SUBDIR}\n{cmd}"
 
-    transfer = condor.transfer_list(args.wheel, args.file_table, args.config)
+    transfer = condor.transfer_list(args.wheel, args.file_table, args.config,
+                                    manifest)
     sub = condor.write_jobs(args.logdir, jobs, transfer, args.eosoutdir,
                             args.wheel, cpu=args.cpu, queue=args.queue,
                             ram=args.memory, disk=args.disk,
