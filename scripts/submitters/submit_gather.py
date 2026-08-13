@@ -57,6 +57,9 @@ def main(argv=None):
     condor.add_common_args(p, ram="4GB", disk="4GB")
     args = p.parse_args(argv)
 
+    condor.check_wheel_fresh(args.wheel,
+                             allow_stale=args.allow_stale_wheel)
+
     # The manifest has to reach the worker as a real file.
     manifest = args.manifest
     if manifest is None:

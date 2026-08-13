@@ -247,9 +247,42 @@ def add_common_args(p, *, ram="4GB", disk="4GB"):
     p.add_argument("--lcg-view", default=LCG_VIEW,
                    help=f"pinned LCG view (default {LCG_VIEW}); override without "
                         "editing the source if nodes move OS")
+    p.add_argument("--allow-stale-wheel", action="store_true",
+                   help="submit even if the wheel predates the source (the jobs "
+                        "will run whatever the wheel contains)")
     p.add_argument("--exec", dest="do_exec", action="store_true",
                    help="run condor_submit instead of only writing the files")
     return p
+
+
+def check_wheel_fresh(wheel, *, allow_stale=False):
+    """Refuse to submit a wheel older than the source it was built from.
+
+    The submitter imports the package from ``src/`` but the jobs install the
+    WHEEL, so editing source without rebuilding leaves the two out of step. The
+    symptom is remote and unhelpful - typically argparse rejecting a flag the
+    local code has - and it costs a full submission to discover. Comparing
+    mtimes catches it in one line, before anything is queued.
+    """
+    if not os.path.exists(wheel):
+        raise SystemExit(f"wheel not found: {wheel}\n  build it with: pip wheel . -w .")
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    newest, newest_f = 0.0, None
+    for root, _, files in os.walk(src):
+        for f in files:
+            if f.endswith(".py"):
+                m = os.path.getmtime(os.path.join(root, f))
+                if m > newest:
+                    newest, newest_f = m, os.path.join(root, f)
+    if newest > os.path.getmtime(wheel):
+        msg = (f"the wheel is older than the source:\n"
+               f"    wheel  {wheel}\n"
+               f"    newer  {newest_f}\n"
+               "  Jobs install the wheel, not your checkout, so they would run "
+               "stale code.\n  Rebuild:  rm -f run3_mj_mixer-*.whl && pip wheel . -w .")
+        if not allow_stale:
+            raise SystemExit(msg)
+        print("WARNING: " + msg)
 
 
 def submit(sub_path):

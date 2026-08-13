@@ -80,6 +80,9 @@ def main(argv=None):
     condor.add_common_args(p, ram="3GB", disk="3GB")
     args = p.parse_args(argv)
 
+    condor.check_wheel_fresh(args.wheel,
+                             allow_stale=args.allow_stale_wheel)
+
     files = load_paths(args.inFile)
     if not files:
         sys.exit(f"No input files found in {args.inFile}")

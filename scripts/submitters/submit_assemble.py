@@ -62,6 +62,9 @@ def main(argv=None):
     condor.add_common_args(p, ram="4GB", disk="4GB")
     args = p.parse_args(argv)
 
+    condor.check_wheel_fresh(args.wheel,
+                             allow_stale=args.allow_stale_wheel)
+
     man_dir = args.manifest and os.path.dirname(args.manifest) or args.pairs_dir
     manifest = load_manifest(man_dir)
     chunks = manifest["chunks"]
