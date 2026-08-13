@@ -17,14 +17,26 @@ What to look for here:
 * **Bytes read** is the slimmed input, so it tracks events read almost exactly;
   it is the panel that shows a job that was handed unusually large files.
 
+`--by-slice` colours each job by the HT slice its files came from, which is how
+to see whether one slice is carrying the cost - the slices differ by orders of
+magnitude in events per file, so "slow job" and "big slice" are easy to confuse
+otherwise. The shading is an ordinal ramp in HT order rather than eight
+unrelated hues, because the slices are ordered bins of one quantity; adjacent
+slices are correspondingly close, so the exact per-slice numbers are printed as
+a table too.
+
     python scripts/monitors/plot_index_jobs.py batch_index
+    python scripts/monitors/plot_index_jobs.py batch_index --by-slice
     python scripts/monitors/plot_index_jobs.py batch_index --x hemispheres
     python scripts/monitors/plot_index_jobs.py batch_index_old batch_index_new
 """
 
 import re
 
-from joblogs import Metric, run_cli
+from joblogs import Grouper, Metric, run_cli
+# filetable owns dataset inference for the whole pipeline; a monitor deciding
+# for itself what counts as a slice would be a fourth copy of that rule.
+from run3_mj_mixer.filetable import UNKNOWN_SLICE, slice_or_unknown
 
 # Anchored on shard.py's stdout: the `Done.` summary per file, and the `Input:`
 # banner, which is how many files this job was handed.
@@ -38,5 +50,39 @@ METRICS = [
     Metric("files", re.compile(r"^Input:\s", re.M), None, "input files"),
 ]
 
+_INPUT = re.compile(r"^Input:\s+(\S+)", re.M)
+_MIXED = "several slices"
+
+
+def ht_slice(out_text):
+    """The HT slice a job's files came from, or None if it printed no inputs.
+
+    `submit_index.py` is fed filelists grouped by slice, so a job is normally
+    one slice - but `-n` can straddle a boundary, and a job that did is called
+    out rather than being filed under whichever slice happened to come first.
+    Passing no xs keys makes `slice_or_unknown` fall through to its HT regex,
+    which is what is wanted here: a label, not a weight, and no xs JSON to find.
+    """
+    found = {slice_or_unknown(path, ()) for path in _INPUT.findall(out_text)}
+    if not found:
+        return None
+    return found.pop() if len(found) == 1 else _MIXED
+
+
+def ht_order(label):
+    """Slices sort by their lower HT edge; the odd ones out sort last."""
+    if label in (_MIXED, UNKNOWN_SLICE):
+        return (1, label)
+    edge = re.search(r"HT-(\d+)", label)
+    return (0, int(edge.group(1))) if edge else (1, label)
+
+
+SLICE = Grouper(flag="--by-slice", dest="by_slice", label="HT slice",
+                help="colour each job by the HT slice of its input files, "
+                     "shaded light to dark in HT order. One log directory "
+                     "only - colour cannot carry both slice and run.",
+                fn=ht_slice, order=ht_order,
+                neutral=(_MIXED, UNKNOWN_SLICE))
+
 if __name__ == "__main__":
-    raise SystemExit(run_cli("1a (index)", METRICS, __doc__))
+    raise SystemExit(run_cli("1a (index)", METRICS, __doc__, grouper=SLICE))

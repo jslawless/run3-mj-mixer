@@ -250,6 +250,50 @@ paste-ready `queue name from` block; drop it into the relevant
 `batch_*/submit.sub` and resubmit. Every stage is idempotent: names are
 deterministic, so a resubmit overwrites via `xrdcp -f`.
 
+## 11b. What the run cost
+
+One monitor per stage, each reading that stage's own logs. They are diagnostics
+— nothing downstream depends on them — but they are how you decide `-n`,
+`--n-jobs`, `--pairs-per-chunk` and the memory request for the next production.
+
+```bash
+# stage 2: throughput against depletion and against elapsed time
+python scripts/monitors/plot_match_rate.py pairs/match_rate.csv --logx
+
+# the three condor stages: wall time, peak memory and bytes read
+# against the work each job actually did
+python scripts/monitors/plot_index_jobs.py    batch_index
+python scripts/monitors/plot_gather_jobs.py   batch_gather --x files
+python scripts/monitors/plot_assemble_jobs.py batch_assemble
+```
+
+The condor monitors join condor's `log_*.log` (timing, peak memory, bytes,
+exit status) to our `log_*.out` (how much work that job did), on the job name.
+`--x` picks what "work" means — `plot_gather_jobs.py --help` lists that stage's
+choices. Pass several log directories **of the same stage** to overlay separate
+runs, which is how you see whether a change helped:
+
+```bash
+python scripts/monitors/plot_gather_jobs.py batch_gather_60 batch_gather_120 \
+    --label "60 jobs" "120 jobs" -o gather_scaling.png
+```
+
+Stage 1a also takes `--by-slice`, which colours each job by the HT slice of its
+input files and prints the per-slice table:
+
+```bash
+python scripts/monitors/plot_index_jobs.py batch_index --by-slice
+```
+
+The slices span orders of magnitude in events per file, so this is what
+separates "that job was slow" from "that slice is big". The shading is an
+ordinal ramp in HT order — the slices are ordered bins of one quantity, so
+adjacent ones are deliberately close, and the printed table is there so no
+number has to be read off a shade. A job whose files straddle a slice boundary
+is labelled `several slices` in neutral grey rather than filed under whichever
+slice came first. The slice label comes from `filetable.slice_or_unknown`, the
+same function that routes the output directories.
+
 ## 12. QA
 
 ```bash

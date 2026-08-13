@@ -176,7 +176,7 @@ Grouped by role:
 | directory | holds |
 |---|---|
 | `scripts/submitters/` | filelist builders and the three condor submitters |
-| `scripts/monitors/` | `check_stage_outputs.py` - what came back, what to resubmit |
+| `scripts/monitors/` | `check_stage_outputs.py` - what came back, what to resubmit; `plot_match_rate.py` for stage 2 and `plot_{index,gather,assemble}_jobs.py` for the condor stages, over `joblogs.py` |
 | `scripts/event_displayers/` | the mixing test display and its drawing primitives |
 
 ## Diagnostics
