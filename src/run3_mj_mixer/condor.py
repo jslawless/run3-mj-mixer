@@ -129,7 +129,14 @@ echo "Base python: $(python3 --version)"
 ## Do NOT unset PYTHONPATH - that is how the view exposes uproot/awkward.
 python3 -m venv --system-site-packages pkg-env
 source pkg-env/bin/activate
+## Record WHICH build ran. The version is pinned at 1.0.0 and the filename never
+## changes, so nothing else in the log distinguishes a fresh wheel from one built
+## days ago - and "the job is running old code" is otherwise only diagnosable by
+## an argparse error several lines later. Compare against md5sum on the wheel you
+## meant to send.
+echo "wheel md5: $(md5sum {wheel} | cut -d' ' -f1)"
 pip install --quiet --no-deps {wheel}
+python3 -c "import run3_mj_mixer, os; print('installed from:', os.path.dirname(run3_mj_mixer.__file__))"
 echo "uproot: $(python3 -c 'import uproot; print(uproot.__version__)')"
 
 echo
