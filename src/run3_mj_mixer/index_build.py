@@ -71,18 +71,23 @@ DERIVED = {
 IDENTITY_COLUMNS = ("file_id", "entry", "hemi_slot")
 
 
+def _xs_keys(table):
+    """Dataset names present in the table, for labelling skipped shards."""
+    return list(table.get("datasets", {}))
+
+
 def _npy(out_dir, name):
     return os.path.join(str(out_dir), f"{name}.npy")
 
 
-def scan_shards(paths, table, *, require_complete=True):
+def scan_shards(paths, table, *, require_complete=True, skip_unlisted=False):
     """First pass: validate shards and work out where each one lands.
 
     Returns a list of ``{path, file_id, n_rows}`` sorted by ``file_id``, which
     is the order the second pass concatenates in.
     """
     h2id = ft.hash_to_id(table)
-    plan, seen_ids = [], {}
+    plan, seen_ids, skipped = [], {}, []
     for p in paths:
         cols, meta = idx.read_shard(p, require_complete=require_complete)
         n = len(cols["entry"])
@@ -92,6 +97,11 @@ def scan_shards(paths, table, *, require_complete=True):
             fid = None
             if meta["source_path"] is not None:
                 fid = h2id.get(idx.file_hash(meta["source_path"]))
+            if fid is None and skip_unlisted:
+                # Also unlisted, just with nothing in it - count it as skipped so
+                # the reported totals add up.
+                skipped.append((str(p), meta["source_path"]))
+                continue
             plan.append({"path": str(p), "file_id": fid, "n_rows": 0})
             continue
 
@@ -103,10 +113,20 @@ def scan_shards(paths, table, *, require_complete=True):
             )
         fh = int(hashes[0])
         if fh not in h2id:
+            # Two very different situations, so do not guess between them:
+            # the shard is for a file deliberately left out of the sample
+            # (--skip-unlisted), or the table is genuinely incomplete (a bug).
+            if skip_unlisted:
+                skipped.append((str(p), meta["source_path"]))
+                continue
             raise ValueError(
-                f"{p} has file_hash {fh:#018x} (source {meta['source_path']!r}) "
-                "which is not in the file table. Rebuild the table over the same "
-                "input set."
+                f"{p}\n  has file_hash {fh:#018x}\n  source {meta['source_path']!r}\n"
+                "  which is not in the file table.\n"
+                "  If you indexed more files than the sample should contain - e.g. "
+                "all HT slices but a table over only some - pass --skip-unlisted "
+                "to build over the table's files and report the rest.\n"
+                "  If the shard should be in the sample, the table is incomplete: "
+                "rebuild it over the same input set."
             )
         fid = h2id[fh]
         if fid in seen_ids:
@@ -129,11 +149,11 @@ def scan_shards(paths, table, *, require_complete=True):
         plan.append({"path": str(p), "file_id": fid, "n_rows": n})
 
     plan.sort(key=lambda r: (r["file_id"] is None, r["file_id"]))
-    return plan
+    return plan, skipped
 
 
 def build(shard_paths, table, out_dir, *, require_complete=True,
-          progress=False, file_table_path=None):
+          progress=False, file_table_path=None, skip_unlisted=False):
     """Merge shards into ``out_dir``, writing the manifest. Returns it too.
 
     The manifest is written here rather than by the CLI so that an index built
@@ -141,7 +161,18 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
     ``HemisphereIndex`` cannot open its own output.
     """
     os.makedirs(str(out_dir), exist_ok=True)
-    plan = scan_shards(shard_paths, table, require_complete=require_complete)
+    plan, skipped = scan_shards(shard_paths, table,
+                                require_complete=require_complete,
+                                skip_unlisted=skip_unlisted)
+    if skipped:
+        # Loud, and grouped, so "I meant to drop those" and "my table is short"
+        # look different at a glance.
+        from collections import Counter
+        by_ds = Counter(ft.slice_or_unknown(src or path, _xs_keys(table))
+                        for path, src in skipped)
+        print(f"skipped {len(skipped):,} shard(s) not in the file table:")
+        for ds, k in sorted(by_ds.items()):
+            print(f"    {ds:<62} {k:>6,}")
     n_rows = int(sum(r["n_rows"] for r in plan))
 
     mm = {name: np.lib.format.open_memmap(
@@ -212,6 +243,7 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
             "w_rel": "per-dataset; look up by file_id in the file table",
         },
         "hemi_id_offsets": OFFSETS_NAME,
+        "skipped_unlisted": len(skipped),
         "counters": {
             "shards_read": len(plan),
             "shards_empty": sum(1 for r in plan if not r["n_rows"]),
@@ -303,6 +335,12 @@ def main(argv=None):
     p.add_argument("--from-file", help="a text file of shard paths, one per line")
     p.add_argument("-t", "--file-table", required=True)
     p.add_argument("-o", "--out-dir", default="global_index")
+    p.add_argument("--skip-unlisted", action="store_true",
+                   help="build over the file table's files and REPORT shards for "
+                        "anything else, instead of refusing. Use when stage 1a "
+                        "indexed more than the sample should contain - e.g. every "
+                        "HT slice, with a table over only some. The file table "
+                        "defines the sample.")
     p.add_argument("--allow-incomplete", action="store_true",
                    help="accept shards with no completion marker (debug only; "
                         "a truncated shard silently shortens the index)")
@@ -322,7 +360,8 @@ def main(argv=None):
         manifest = build(shards, table, args.out_dir,
                          require_complete=not args.allow_incomplete,
                          progress=args.progress,
-                         file_table_path=args.file_table)
+                         file_table_path=args.file_table,
+                         skip_unlisted=args.skip_unlisted)
     except ValueError as exc:
         sys.exit(f"index build: {exc}")
 

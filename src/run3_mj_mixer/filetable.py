@@ -34,6 +34,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -134,6 +135,40 @@ def slice_or_unknown(path, xs_keys):
 
 
 # ---------------------------------------------------------------------------
+# Progress
+# ---------------------------------------------------------------------------
+
+def _progress(iterable, *, total=None, enabled=True, desc=""):
+    """``iterable`` wrapped in a progress bar, or a plain counter without tqdm.
+
+    The fallback matters: this scan opens every slimmed file over xrootd and
+    takes minutes at full scale, so silence reads as a hang. Falling back to
+    periodic lines is better than falling back to nothing.
+    """
+    if not enabled:
+        return iterable
+    try:
+        from tqdm import tqdm
+        return tqdm(iterable, total=total, unit="file", desc=desc)
+    except ImportError:
+        pass
+
+    def counter():
+        t0 = last = time.monotonic()
+        for i, item in enumerate(iterable, 1):
+            yield item
+            now = time.monotonic()
+            if now - last > 5.0 or i == total:
+                rate = i / max(now - t0, 1e-9)
+                eta = (total - i) / rate if total and rate else 0
+                print(f"  {desc}: {i:,}/{total:,}  {rate:.1f} file/s  "
+                      f"eta {eta / 60:.1f} min", flush=True)
+                last = now
+
+    return counter()
+
+
+# ---------------------------------------------------------------------------
 # n_original: the slice-wide denominator
 # ---------------------------------------------------------------------------
 
@@ -178,20 +213,20 @@ def scan_n_original(paths, xs_keys, *, workers=1, progress=False):
             )
         datasets[p] = ds
 
-    iterator = paths
+    # One progress wrapper for both paths. Previously the threaded branch had
+    # none, so --progress --workers 8 - the combination the docs recommend -
+    # printed nothing for the several minutes this takes over xrootd.
     if workers > 1:
         from concurrent.futures import ThreadPoolExecutor
-        pool = ThreadPoolExecutor(max_workers=workers)
-        values = list(pool.map(read_cutflow0, paths))
-        pool.shutdown()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # executor.map yields in order as results arrive, so it wraps
+            values = list(_progress(pool.map(read_cutflow0, paths),
+                                    total=len(paths), enabled=progress,
+                                    desc=f"cutflow scan ({workers} workers)"))
     else:
-        if progress:
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(paths, unit="file", desc="cutflow scan")
-            except ImportError:
-                pass
-        values = [read_cutflow0(p) for p in iterator]
+        values = [read_cutflow0(p) for p in
+                  _progress(paths, total=len(paths), enabled=progress,
+                            desc="cutflow scan")]
 
     n_original = {}
     for p, n0 in zip(paths, values):
@@ -469,12 +504,35 @@ def main(argv=None):
     p.add_argument("--extend", default=None, metavar="TABLE",
                    help="an existing table to extend append-only, preserving "
                         "its file_ids so hemi_ids stay stable")
-    p.add_argument("--workers", type=int, default=1)
-    p.add_argument("--progress", action="store_true")
+    p.add_argument("--workers", type=int, default=1,
+                   help="threads for the cutflow scan (default 1). Each file is "
+                        "one small remote read, so this is latency-bound and 8-16 "
+                        "helps a lot at full scale.")
+    p.add_argument("--progress", dest="progress", action="store_true",
+                   default=sys.stderr.isatty(),
+                   help="progress bar (default: on when attached to a terminal)")
+    p.add_argument("--no-progress", dest="progress", action="store_false")
     args = p.parse_args(argv)
 
     paths = _read_paths(args)
     extend = load_file_table(args.extend) if args.extend else None
+
+    # Say what is about to happen BEFORE the slow part. At full scale the scan
+    # opens every slimmed file over xrootd and runs for minutes; starting with a
+    # silent pause is indistinguishable from a hang.
+    print(f"mode:     {args.mode}")
+    print(f"inputs:   {len(paths):,} file(s)")
+    if extend:
+        print(f"extending {args.extend} ({extend['n_files']:,} already in it)")
+    if args.mode == "mc":
+        xs_path = locate_xs_json(args.xs_json)
+        print(f"xs json:  {xs_path}")
+        print(f"scanning cutflow[0] of every file "
+              f"({args.workers} worker(s)) - this is the slow step")
+    else:
+        print("data mode: no cross sections, no cutflow scan")
+
+    t0 = time.monotonic()
     try:
         table = build_file_table(
             paths, mode=args.mode, xs_json=args.xs_json,
@@ -482,15 +540,24 @@ def main(argv=None):
         )
     except ValueError as exc:
         sys.exit(f"file table: {exc}")
+    dt = time.monotonic() - t0
 
     save_file_table(table, args.output)
-    print(f"mode:    {table['mode']}")
-    print(f"files:   {table['n_files']}")
-    print(f"xs json: {table['xs_json']}")
-    print(f"{'dataset':<62} {'n_original_sum':>15} {'w_rel':>12}")
+
+    print()
+    print(f"{'dataset':<62} {'files':>7} {'n_original_sum':>16} {'w_rel':>12}")
+    print("-" * 100)
+    total_files = total_events = 0
     for ds, d in sorted(table["datasets"].items()):
         n0 = "-" if d["n_original_sum"] is None else f"{d['n_original_sum']:,.0f}"
-        print(f"{ds:<62} {n0:>15} {d['w_rel']:>12.4g}")
+        total_files += d["n_files"]
+        total_events += d["n_original_sum"] or 0.0
+        print(f"{ds:<62} {d['n_files']:>7,} {n0:>16} {d['w_rel']:>12.4g}")
+    print("-" * 100)
+    print(f"{'total':<62} {total_files:>7,} {total_events:>16,.0f}")
+    print()
+    print(f"scanned {table['n_files']:,} file(s) in {dt:.1f}s "
+          f"({table['n_files'] / max(dt, 1e-9):.1f} file/s)")
     print(f"-> {args.output}")
     return 0
 
