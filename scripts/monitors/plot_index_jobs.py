@@ -17,12 +17,10 @@ What to look for here:
 * **Bytes read** is the slimmed input, so it tracks events read almost exactly;
   it is the panel that shows a job that was handed unusually large files.
 
-`--by-slice` keys each job by the HT slice its files came from, which is how to
-see whether one slice is carrying the cost - the slices differ by orders of
+`--by-slice` colours each job by the HT slice its files came from, which is how
+to see whether one slice is carrying the cost - the slices differ by orders of
 magnitude in events per file, so "slow job" and "big slice" are easy to confuse
-otherwise. Slices are keyed by hue and marker shape together, since a scatter
-with eleven groups has more groups than any set of hues separates; the exact
-per-slice numbers are printed as a table alongside.
+otherwise. The exact per-slice numbers are printed as a table alongside.
 
     python scripts/monitors/plot_index_jobs.py batch_index
     python scripts/monitors/plot_index_jobs.py batch_index --by-slice
@@ -77,9 +75,9 @@ def ht_order(label):
 
 
 SLICE = Grouper(flag="--by-slice", dest="by_slice", label="HT slice",
-                help="colour each job by the HT slice of its input files, "
-                     "shaded light to dark in HT order. One log directory "
-                     "only - colour cannot carry both slice and run.",
+                help="colour each job by the HT slice of its input files. "
+                     "One log directory only - colour cannot carry both "
+                     "slice and run.",
                 fn=ht_slice, order=ht_order,
                 neutral=(_MIXED, UNKNOWN_SLICE))
 

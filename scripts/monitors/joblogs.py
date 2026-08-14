@@ -26,10 +26,9 @@ what eventually walks a job into the limit. **Bytes read vs work** says whether
 reads are proportional or whether jobs pay to open files they barely touch.
 
 A stage may also declare a `Grouper`, which turns its own stdout into a label
-per job and adds a flag to key by it (stage 1a: HT slice). Groups are keyed by
-**hue and marker shape together** - see `CATEGORICAL` for why three hues rather
-than one per group. Grouping also prints an exact per-group table, so no
-reading depends on telling two marks apart.
+per job and adds a flag to colour by it (stage 1a: HT slice), from
+matplotlib's tab20. Grouping also prints an exact per-group table, so no
+reading depends on telling two colours apart.
 """
 
 from __future__ import annotations
@@ -55,9 +54,9 @@ Metric = namedtuple("Metric", "key pattern group label")
 
 #: An optional way for a stage to split its jobs. `fn` reads the job's stdout
 #: and returns a label (or None); `order` sorts the labels; `flag` is the
-#: command-line switch that turns colouring on; `neutral` names the labels that
-#: are outside the ordered sequence, so they get neutral ink and their own
-#: shape rather than one of the sequence's keys.
+#: command-line switch that turns colouring on; `neutral` names the labels
+#: that are outside the ordered sequence, so they get neutral ink rather than
+#: one of the sequence's colours.
 Grouper = namedtuple("Grouper", "flag dest label help fn order neutral")
 
 # Series colours are slots 1-3 of the validated categorical palette, in fixed
@@ -73,51 +72,28 @@ THEME = {
              "series": ("#3987e5", "#d95926", "#199e70")},
 }
 
-# Groups are keyed by hue AND marker shape together. Three hues is not a
-# stylistic choice: this is a scatter, so any two groups can land side by side
-# and EVERY pair has to separate, not just neighbours in a legend. Measured on
-# the categorical palette, all-pairs worst case:
-#
-#     slots   normal-vision dE          CVD dE (floor 8)
-#       3     24.0 light / 20.9 dark    9.9 light / 10.1 dark   PASS
-#       4     13.7 light / 10.6 dark    9.5 light /  4.7 dark   FAIL
-#       8      7.1 light /  7.1 dark    3.3 light /  1.6 dark   FAIL
-#
-# Eight hues in a scatter are not eight identities - under CVD they are close
-# to one. So hue carries three states and shape carries the rest, giving 12
-# combinations that are all distinct in at least one channel, and distinct in
-# greyscale and under any CVD. Hue cycles fastest so that ADJACENT groups - the
-# ones most often confused - always differ in colour, never only in shape.
-CATEGORICAL = {"light": ("#2a78d6", "#eb6834", "#1baf7a"),
-               "dark": ("#3987e5", "#d95926", "#199e70")}
-#: Sized to roughly equal visual weight; matplotlib's 's' is area, not extent.
-MARKERS = (("o", 30), ("^", 38), ("s", 28), ("D", 24))
-#: For groups outside the ordered sequence, in neutral ink with its own shape.
-NEUTRAL_MARKER = ("P", 40)
+# Group colours: matplotlib's tab20, reordered so the ten strong tab10 hues
+# come first and their pale twins after - otherwise a blue and a pale blue land
+# next to each other in the first two groups.
+_TAB20 = matplotlib.colormaps["tab20"].colors
+GROUP_COLOURS = ([_TAB20[i] for i in range(0, 20, 2)]
+                 + [_TAB20[i] for i in range(1, 20, 2)])
 
 
-def group_styles(groups, theme, neutral=()):
-    """[(label, colour, marker, size), ...] in group order.
+def group_colours(groups, theme, neutral=()):
+    """[(label, colour), ...] in group order.
 
     Labels outside the sequence - "several slices", an unrecognised name - take
-    neutral ink and their own shape, so they never read as one of the ordered
-    groups.
+    neutral ink, so they never read as one of the ordered groups.
     """
-    hues = CATEGORICAL[theme]
-    limit = len(hues) * len(MARKERS)
     ordered = [g for g in groups if g not in neutral]
-    if len(ordered) > limit:
+    if len(ordered) > len(GROUP_COLOURS):
         raise SystemExit(
-            f"{len(ordered)} groups is more than the {limit} hue x shape "
-            f"combinations available ({len(hues)} hues that separate in a "
-            f"scatter, {len(MARKERS)} shapes). Beyond this a key would have to "
-            "repeat, which reads as two groups being the same one.")
-    style = {}
-    for i, g in enumerate(ordered):
-        marker, size = MARKERS[i // len(hues)]
-        style[g] = (hues[i % len(hues)], marker, size)
-    ink = THEME[theme]["ink2"]
-    return [(g,) + style.get(g, (ink,) + NEUTRAL_MARKER) for g in groups]
+            f"{len(ordered)} groups is more than the {len(GROUP_COLOURS)} "
+            "colours available; a repeated colour would read as two groups "
+            "being the same one.")
+    pick = dict(zip(ordered, GROUP_COLOURS))
+    return [(g, pick.get(g, THEME[theme]["ink2"])) for g in groups]
 
 
 #: (column, panel title, unit, scale from the recorded unit)
@@ -299,8 +275,8 @@ def _scale(ax, which, log, values, origin, comma, n_ticks):
 def summarize_groups(runs, met, grouper):
     """A per-group table, printed whenever colouring by group.
 
-    Eleven groups is more than any key reads cleanly at, so these are the
-    numbers - nothing has to be read off a mark.
+    Eleven colours is more than reads cleanly, so these are the numbers -
+    nothing has to be read off a swatch.
     """
     rows = [r for _, rows in runs for r in rows]
     groups = group_order(runs, grouper)
@@ -334,7 +310,7 @@ def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
     """`runs` is [(name, rows), ...] - several are overlaid for comparison.
 
     `groups`, when given, is [(label, colour), ...] in group order; points are
-    then keyed by group instead of coloured by run.
+    then coloured by group instead of by run.
     """
     t = THEME[theme]
     comma = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.6g}")
@@ -365,11 +341,11 @@ def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
                 # One scatter per group, in group order, so the legend reads in
                 # that order too.
                 who = np.array([r.get("group") for r in rows], dtype=object)
-                for g, colour, marker, size in groups:
+                for g, colour in groups:
                     sel = m & ok & (who == g)
                     if sel.any():
-                        ax.scatter(x[sel], y[sel], s=size, c=colour, alpha=0.8,
-                                   marker=marker, edgecolors="none", label=g)
+                        ax.scatter(x[sel], y[sel], s=28, color=colour,
+                                   alpha=0.8, edgecolors="none", label=g)
             else:
                 # A lone unnamed series needs no legend entry - the panel title
                 # already says what it is. With several runs the name is the
@@ -409,7 +385,7 @@ def draw(fig, runs, met, stage, theme, logx=False, logy=False, origin=False,
     if len(runs) > 1:
         head += f" over {len(runs)} runs"
     if group_label:
-        head += f"   keyed by {group_label}"
+        head += f"   coloured by {group_label}"
     if n_bad:
         head += f"   {n_bad} not ok"
     # A job with no work count is not on the scatter, so the header would
@@ -537,8 +513,8 @@ def run_cli(stage, metrics, doc, grouper=None, argv=None):
 
     theme = "dark" if args.dark else "light"
     if by_group:
-        groups = group_styles(group_order(runs, grouper), theme,
-                              grouper.neutral)
+        groups = group_colours(group_order(runs, grouper), theme,
+                               grouper.neutral)
     fig = plt.figure(figsize=(13.5, 4.4))
     draw(fig, runs, met, stage, theme, logx=args.logx, logy=args.logy,
          origin=args.origin, groups=groups,
