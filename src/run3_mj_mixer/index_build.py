@@ -150,19 +150,86 @@ def scan_shards(paths, table, *, require_complete=True, skip_unlisted=False,
     return plan, skipped
 
 
+def check_base(base_dir, base_table, base_table_path, table):
+    """Validate an existing index as the prefix of a new build. Returns its
+    manifest.
+
+    Appending is only a concatenation if the base index covers exactly the
+    first ``n_files`` files of ``table``, in the same order and with the same
+    weights - i.e. ``table`` was made by extending ``base_table``, and
+    ``base_table`` is the table the base index was built from.
+    """
+    with open(os.path.join(str(base_dir), MANIFEST_NAME)) as f:
+        base = json.load(f)
+    if base.get("schema") != SCHEMA:
+        raise ValueError(f"{base_dir} is not a {SCHEMA}")
+    if base["mode"] != table["mode"]:
+        raise ValueError(f"base index is {base['mode']!r}, table is "
+                         f"{table['mode']!r}")
+    want = base.get("file_table_sha256")
+    if want is None or want != ft._sha256(base_table_path):
+        raise ValueError(
+            f"{base_table_path} is not the file table {base_dir} was built "
+            f"from (sha256 {want})")
+    n = int(base["n_files"])
+    if int(base_table["n_files"]) != n:
+        raise ValueError(f"base table has {base_table['n_files']} files, base "
+                         f"index {n}")
+    old = sorted(base_table["files"], key=lambda r: int(r["file_id"]))
+    new = {int(r["file_id"]): r for r in table["files"]}
+    for rec in old:
+        got = new.get(int(rec["file_id"]))
+        if got is None or any(got[k] != rec[k] for k in
+                              ("path", "file_hash", "dataset")):
+            raise ValueError(
+                f"file_id {rec['file_id']} ({rec['path']}) differs between the "
+                "base table and the new one; the new table must extend the "
+                "base table (run3-mj-file-table --extend)")
+    for ds, rec in base_table["datasets"].items():
+        if table["datasets"].get(ds, {}).get("w_rel") != rec["w_rel"]:
+            raise ValueError(
+                f"dataset {ds!r} has a different w_rel in the new table; the "
+                "base index's files must keep their weights")
+    return base
+
+
 def build(shard_paths, table, out_dir, *, require_complete=True,
-          progress=False, file_table_path=None, skip_unlisted=False):
+          progress=False, file_table_path=None, skip_unlisted=False,
+          base_dir=None, base_table=None, base_table_path=None,
+          max_rows_per_event=None):
     """Merge shards into ``out_dir``, writing the manifest. Returns it too.
 
     The manifest is written here rather than by the CLI so that an index built
     through the library API is complete and self-describing - anything less and
     ``HemisphereIndex`` cannot open its own output.
+
+    With ``base_dir``, the rows of that existing index come first, copied
+    as they are, and ``shard_paths`` only need to cover the files ``table``
+    adds after it (see ``check_base``). The base's shards are not re-read.
+
+    ``max_rows_per_event`` is recorded for QA's run:lumi:event check, for an
+    index that deliberately holds one event several times (e.g. copies of a
+    signal file).
     """
     os.makedirs(str(out_dir), exist_ok=True)
+    base = None
+    if base_dir is not None:
+        if base_table is None or base_table_path is None:
+            raise ValueError("base_dir needs base_table and base_table_path")
+        if os.path.abspath(str(base_dir)) == os.path.abspath(str(out_dir)):
+            raise ValueError("the output directory must not be the base index")
+        base = check_base(base_dir, base_table, base_table_path, table)
     plan, skipped = scan_shards(shard_paths, table,
                                 require_complete=require_complete,
                                 skip_unlisted=skip_unlisted,
                                 progress=progress)
+    if base is not None:
+        inside = [r["path"] for r in plan
+                  if r["file_id"] is not None and r["file_id"] < base["n_files"]]
+        if inside:
+            raise ValueError(
+                f"{len(inside)} shard(s) are for files already in the base "
+                f"index, e.g. {inside[0]}; pass only the new files' shards")
     if skipped:
         # Loud, and grouped, so "I meant to drop those" and "my table is short"
         # look different at a glance.
@@ -172,7 +239,8 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
         print(f"skipped {len(skipped):,} shard(s) not in the file table:")
         for ds, k in sorted(by_ds.items()):
             print(f"    {ds:<62} {k:>6,}")
-    n_rows = int(sum(r["n_rows"] for r in plan))
+    n_base = int(base["n_rows"]) if base is not None else 0
+    n_rows = n_base + int(sum(r["n_rows"] for r in plan))
 
     mm = {name: np.lib.format.open_memmap(
               _npy(out_dir, name), mode="w+", dtype=dt, shape=(n_rows,))
@@ -181,10 +249,26 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
     n_files = max((int(r["file_id"]) for r in table["files"]), default=-1) + 1
     offsets = np.zeros(n_files + 1, dtype=np.int64)
 
+    pos = 0
+    if base is not None:
+        # Copy in blocks: the base columns are memory-mapped, and a full-size
+        # temporary per column would double the peak memory.
+        block = 1 << 22
+        for name in CARRIED:
+            src = np.load(_npy(base_dir, name), mmap_mode="r")
+            if len(src) != n_base:
+                raise ValueError(f"{base_dir}/{name}.npy has {len(src)} rows, "
+                                 f"manifest says {n_base}")
+            for lo in range(0, n_base, block):
+                hi = min(lo + block, n_base)
+                mm[name][lo:hi] = src[lo:hi]
+        base_off = np.load(_npy(base_dir, "hemi_id_offsets"))
+        offsets[1:len(base_off)] = np.diff(base_off)
+        pos = n_base
+
     it = _progress(plan, total=len(plan), enabled=progress,
                    desc="merging shards", unit="shard")
 
-    pos = 0
     for rec in it:
         if rec["n_rows"] == 0:
             continue
@@ -260,6 +344,14 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
             "rows": n_rows,
         },
     }
+    if base is not None:
+        manifest["n_files_with_rows"] += int(base["n_files_with_rows"])
+        manifest["base_index"] = {"dir": os.path.abspath(str(base_dir)),
+                                  "index_id": base["index_id"],
+                                  "n_rows": n_base,
+                                  "n_files": int(base["n_files"])}
+    if max_rows_per_event is not None:
+        manifest["max_rows_per_event"] = int(max_rows_per_event)
     manifest["index_id"] = index_id(out_dir, manifest)
     save_manifest(manifest, out_dir)
     return manifest
@@ -354,8 +446,20 @@ def main(argv=None):
     p.add_argument("--allow-incomplete", action="store_true",
                    help="accept shards with no completion marker (debug only; "
                         "a truncated shard silently shortens the index)")
+    p.add_argument("--base-index", default=None, metavar="DIR",
+                   help="an existing index to append to: its rows are copied "
+                        "first and its shards are not re-read. The shards given "
+                        "must cover only the files -t adds after it.")
+    p.add_argument("--base-file-table", default=None, metavar="TABLE",
+                   help="the file table --base-index was built from (checked "
+                        "by sha256); -t must extend it")
+    p.add_argument("--max-rows-per-event", type=int, default=None, metavar="N",
+                   help="record that one run:lumi:event may appear N times "
+                        "(e.g. N copies of a signal file), for QA")
     p.add_argument("--progress", action="store_true")
     args = p.parse_args(argv)
+    if (args.base_index is None) != (args.base_file_table is None):
+        sys.exit("--base-index and --base-file-table go together")
 
     shards = list(args.shards)
     if args.from_file:
@@ -366,12 +470,17 @@ def main(argv=None):
         sys.exit("No shards given (pass paths, or --from-file).")
 
     table = ft.load_file_table(args.file_table)
+    base_table = (ft.load_file_table(args.base_file_table)
+                  if args.base_file_table else None)
     try:
         manifest = build(shards, table, args.out_dir,
                          require_complete=not args.allow_incomplete,
                          progress=args.progress,
                          file_table_path=args.file_table,
-                         skip_unlisted=args.skip_unlisted)
+                         skip_unlisted=args.skip_unlisted,
+                         base_dir=args.base_index, base_table=base_table,
+                         base_table_path=args.base_file_table,
+                         max_rows_per_event=args.max_rows_per_event)
     except ValueError as exc:
         sys.exit(f"index build: {exc}")
 

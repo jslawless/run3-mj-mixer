@@ -251,9 +251,19 @@ def build_file_table(paths, *, mode="mc", xs_json=None, workers=1,
     In ``--mode data`` no cross sections and no cutflow scan are involved:
     ``w_rel`` is 1 for every file. ``dataset`` is still recorded for provenance,
     via ``slice_or_unknown`` so an unmatched data filename is not an error.
+
+    With ``extend``, ``paths`` may be only the NEW files. A dataset that none of
+    them belongs to keeps its entry from ``extend`` unchanged, so its weight
+    needs no re-scan of files already counted. A dataset that some of them DO
+    belong to is re-summed from ``paths``, so every one of its existing files
+    must be passed too - otherwise its denominator would silently become the
+    new files' sum alone, and that is refused.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+    if extend and extend.get("mode") != mode:
+        raise ValueError(
+            f"cannot extend a {extend.get('mode')!r} table in --mode {mode}")
 
     # A file has TWO path forms and they are not interchangeable:
     #   path - redirector stripped. Identity only: it is what file_id ordering
@@ -348,6 +358,24 @@ def build_file_table(paths, *, mode="mc", xs_json=None, workers=1,
                  "n_files": sum(1 for f in files if f["dataset"] == ds)}
             for ds in sorted(set(datasets.values()))
         }
+
+    if extend:
+        passed = set(norm)
+        for ds, rec in sorted(extend["datasets"].items()):
+            if ds not in per_dataset:
+                per_dataset[ds] = dict(rec)
+                continue
+            missing = sorted(f["path"] for f in extend["files"]
+                             if f["dataset"] == ds and f["path"] not in passed)
+            if mode == "mc" and missing:
+                raise ValueError(
+                    f"dataset {ds!r} is already in the table being extended, "
+                    f"and {len(missing)} of its existing file(s) were not "
+                    f"passed (e.g. {missing[0]}), so its n_original_sum would "
+                    "count only the files given. Pass every file of that "
+                    "dataset, or give the new files their own dataset."
+                )
+        per_dataset = dict(sorted(per_dataset.items()))
 
     table = {
         "schema": SCHEMA,
@@ -503,7 +531,8 @@ def main(argv=None):
     p.add_argument("--xs-json", default=None)
     p.add_argument("--extend", default=None, metavar="TABLE",
                    help="an existing table to extend append-only, preserving "
-                        "its file_ids so hemi_ids stay stable")
+                        "its file_ids so hemi_ids stay stable. Pass only the new "
+                        "files; datasets they do not touch keep their weights.")
     p.add_argument("--workers", type=int, default=1,
                    help="threads for the cutflow scan (default 1). Each file is "
                         "one small remote read, so this is latency-bound and 8-16 "
@@ -556,8 +585,8 @@ def main(argv=None):
     print("-" * 100)
     print(f"{'total':<62} {total_files:>7,} {total_events:>16,.0f}")
     print()
-    print(f"scanned {table['n_files']:,} file(s) in {dt:.1f}s "
-          f"({table['n_files'] / max(dt, 1e-9):.1f} file/s)")
+    print(f"scanned {len(paths):,} file(s) in {dt:.1f}s "
+          f"({len(paths) / max(dt, 1e-9):.1f} file/s)")
     print(f"-> {args.output}")
     return 0
 
