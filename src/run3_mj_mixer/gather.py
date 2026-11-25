@@ -184,12 +184,19 @@ def read_file_legs(slimmed_path, requests, fields, *, tree_name="events",
     return out
 
 
-def write_legs(out_dir, job_id, records, fields):
+def write_legs(out_dir, job_id, records, fields, chunk_ids=None):
     """Write one file per destination chunk: legA_<job>_<chunk>.root.
 
     Bucketing by destination is what lets a stage-3b job read only its own share.
     The alternative - one file per gather job - would make every 3b job read the
     entire intermediate.
+
+    ``chunk_ids``: every chunk of the pair manifest. A chunk this job owes no
+    legs to still gets a file - the completion marker and no legs tree - because
+    stage 3b opens legA_<job>_<chunk> for EVERY job, so an absent file is read as
+    a failed gather job. That case is real in a sparse pool (e.g. a subsampled
+    index), where a job's files can be referenced by no pair of some chunk, or by
+    none at all. ``load_legs`` already skips a marker-only file.
     """
     import uproot
 
@@ -223,6 +230,17 @@ def write_legs(out_dir, job_id, records, fields):
         os.replace(tmp, path)
         written.append({"file": name, "chunk_id": chunk,
                         "n_legs": len(b["pair_id"])})
+    for chunk in sorted(set(int(c) for c in (chunk_ids or ())) - set(by_chunk)):
+        name = f"legA_{job_id:04d}_{chunk:05d}.root"
+        path = os.path.join(str(out_dir), name)
+        tmp = path + ".tmp"
+        with uproot.recreate(tmp) as f:
+            f["job_id"] = M._label(str(job_id))
+            f["chunk_id"] = M._label(str(chunk))
+            f["complete"] = M._label("ok")
+        os.replace(tmp, path)
+        written.append({"file": name, "chunk_id": chunk, "n_legs": 0})
+    written.sort(key=lambda w: w["chunk_id"])
     return written
 
 
@@ -311,7 +329,8 @@ def main(argv=None):
         for k, v in got.items():
             merged[k].extend(v)
 
-    written = write_legs(args.out_dir, args.job, merged, fields)
+    written = write_legs(args.out_dir, args.job, merged, fields,
+                         chunk_ids=[c["chunk_id"] for c in manifest["chunks"]])
     print(f"wrote {len(written)} leg file(s), {len(merged['pair_id']):,} legs")
     for w in written:
         print(f"    {w['file']}  {w['n_legs']:,} legs")

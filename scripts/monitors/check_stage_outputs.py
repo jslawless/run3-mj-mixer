@@ -36,7 +36,8 @@ def check_legs(manifest, legs_dir, n_jobs):
             want.append((j, name))
             if not os.path.exists(os.path.join(legs_dir, name)):
                 missing.append(f"gather_{j:04d}")
-    return sorted(set(missing)), len(want)
+    # (jobs with an absent file, files expected, files absent)
+    return sorted(set(missing)), len(want), len(missing)
 
 
 def check_stitched(manifest, out_dir):
@@ -88,7 +89,10 @@ def main(argv=None):
             sys.exit(f"could not read P from {args.gather_manifest} ({exc}); "
                      "pass -P explicitly with the value stage 3a used.")
     if args.stage == "legs":
-        bad, total = check_legs(manifest, args.dir, n_gather)
+        bad, total, n_absent = check_legs(manifest, args.dir, n_gather)
+        print(f"legs: {n_absent} of {total} leg files absent, "
+              f"from {len(bad)} gather job(s)")
+        total = n_gather
         bad = [(b, "absent") for b in bad]
     else:
         bad, total = check_stitched(manifest, args.dir)
