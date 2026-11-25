@@ -242,9 +242,7 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
     n_base = int(base["n_rows"]) if base is not None else 0
     n_rows = n_base + int(sum(r["n_rows"] for r in plan))
 
-    mm = {name: np.lib.format.open_memmap(
-              _npy(out_dir, name), mode="w+", dtype=dt, shape=(n_rows,))
-          for name, dt in CARRIED.items()}
+    mm = open_columns(out_dir, n_rows)
 
     n_files = max((int(r["file_id"]) for r in table["files"]), default=-1) + 1
     offsets = np.zeros(n_files + 1, dtype=np.int64)
@@ -301,9 +299,60 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
         pos += n
     assert pos == n_rows, f"filled {pos} of {n_rows} rows"
 
-    # offsets[i+1] currently holds file i's row count; make it cumulative so
-    # offsets[i]:offsets[i+1] is file i's contiguous hemi_id range.
+    finish_columns(out_dir, mm, offsets)
+
+    manifest = core_manifest(
+        mode=table["mode"], n_rows=n_rows, n_files=n_files,
+        n_files_with_rows=sum(1 for r in plan if r["n_rows"]),
+        file_table=(os.path.basename(file_table_path) if file_table_path
+                    else "file_table.json"),
+        file_table_sha256=(ft._sha256(file_table_path) if file_table_path
+                           else None))
+    manifest.update({
+        "skipped_unlisted": len(skipped),
+        "counters": {
+            "shards_read": len(plan),
+            "shards_empty": sum(1 for r in plan if not r["n_rows"]),
+            "rows": n_rows,
+        },
+    })
+    if base is not None:
+        manifest["n_files_with_rows"] += int(base["n_files_with_rows"])
+        manifest["base_index"] = {"dir": os.path.abspath(str(base_dir)),
+                                  "index_id": base["index_id"],
+                                  "n_rows": n_base,
+                                  "n_files": int(base["n_files"])}
+    if max_rows_per_event is not None:
+        manifest["max_rows_per_event"] = int(max_rows_per_event)
+    manifest["index_id"] = index_id(out_dir, manifest)
+    save_manifest(manifest, out_dir)
+    return manifest
+
+
+def open_columns(out_dir, n_rows):
+    """Writable memory-mapped ``.npy`` files for every CARRIED column.
+
+    Shared by ``build`` and ``subsample`` so the on-disk column set and dtypes
+    are defined in one place.
+    """
+    return {name: np.lib.format.open_memmap(
+                _npy(out_dir, name), mode="w+", dtype=dt, shape=(n_rows,))
+            for name, dt in CARRIED.items()}
+
+
+def finish_columns(out_dir, mm, offsets):
+    """Write ``hemi_id_offsets`` and the derived columns, and flush ``mm``.
+
+    ``offsets`` has length ``n_files + 1`` and, on entry, holds file i's row
+    count at ``offsets[i + 1]``; it is made cumulative IN PLACE, so that
+    ``offsets[i]:offsets[i+1]`` is file i's contiguous hemi_id range. The rows
+    in ``mm`` must already be in canonical order.
+    """
+    n_rows = len(mm["pt"])
     np.cumsum(offsets, out=offsets)
+    if int(offsets[-1]) != n_rows:
+        raise ValueError(f"offsets cover {int(offsets[-1])} rows, columns "
+                         f"have {n_rows}")
     np.save(_npy(out_dir, "hemi_id_offsets"), offsets)
 
     # entry is narrowed to int32 at merge; make the limit explicit rather than
@@ -317,19 +366,25 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
     for m in mm.values():
         m.flush()
 
-    manifest = {
+
+def core_manifest(*, mode, n_rows, n_files, n_files_with_rows, file_table,
+                  file_table_sha256):
+    """The manifest fields every index carries, with ``index_id`` unset.
+
+    Callers add their own provenance, then set ``index_id`` with ``index_id()``
+    once the identity columns are on disk.
+    """
+    return {
         "schema": SCHEMA,
         "schema_version": SCHEMA_VERSION,
         "index_id": None,
-        "mode": table["mode"],
+        "mode": mode,
         "n_rows": n_rows,
         "n_files": n_files,
-        "n_files_with_rows": sum(1 for r in plan if r["n_rows"]),
+        "n_files_with_rows": n_files_with_rows,
         "canonical_sort": list(IDENTITY_COLUMNS),
-        "file_table": (os.path.basename(file_table_path) if file_table_path
-                       else "file_table.json"),
-        "file_table_sha256": (ft._sha256(file_table_path) if file_table_path
-                              else None),
+        "file_table": file_table,
+        "file_table_sha256": file_table_sha256,
         "columns": {name: {"file": f"{name}.npy", "dtype": dt.name}
                     for name, dt in {**CARRIED, **DERIVED}.items()},
         "not_stored": {
@@ -337,24 +392,7 @@ def build(shard_paths, table, out_dir, *, require_complete=True,
             "w_rel": "per-dataset; look up by file_id in the file table",
         },
         "hemi_id_offsets": OFFSETS_NAME,
-        "skipped_unlisted": len(skipped),
-        "counters": {
-            "shards_read": len(plan),
-            "shards_empty": sum(1 for r in plan if not r["n_rows"]),
-            "rows": n_rows,
-        },
     }
-    if base is not None:
-        manifest["n_files_with_rows"] += int(base["n_files_with_rows"])
-        manifest["base_index"] = {"dir": os.path.abspath(str(base_dir)),
-                                  "index_id": base["index_id"],
-                                  "n_rows": n_base,
-                                  "n_files": int(base["n_files"])}
-    if max_rows_per_event is not None:
-        manifest["max_rows_per_event"] = int(max_rows_per_event)
-    manifest["index_id"] = index_id(out_dir, manifest)
-    save_manifest(manifest, out_dir)
-    return manifest
 
 
 def save_manifest(manifest, out_dir):

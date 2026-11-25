@@ -140,6 +140,35 @@ JSON at all.
 > loudly rather than under-counting the denominator — deliberate, but it means one
 > bad slimmed file blocks you until it is re-slimmed.
 
+### 6b. Optional — a data-like pool at fixed luminosity (study 1b)
+
+The full MC index draws hemispheres by row count and applies `w_rel` only at
+histogram time. To instead build the pool a dataset of luminosity `L` would give,
+subsample the index, keeping each **event** with probability
+`p = min(1, w_rel · L)` (`w_rel` in pb per event, `L` in pb⁻¹):
+
+```bash
+run3-mj-index-subsample global_index/ -t file_table.json \
+    -o index_lumi/ --lumi-pb max --drop-dataset HT-200to400 --seed 0 --progress
+```
+
+- `--lumi-pb max` sets `L = 1 / max(w_rel)` over the retained datasets (about
+  200 pb⁻¹ once HT 200–400 is dropped), the largest `L` at which no slice is
+  capped at `p = 1`. A number gives `L` directly; a capped slice is reported
+  (`CAPPED`) because it is then under-represented.
+- `--drop-dataset` matches by substring and may be repeated. A pattern matching
+  nothing is an error; beware that `HT-200` would also match `HT-2000`.
+- The draw is a hash of `(run, luminosityBlock, event, seed)`, not an RNG stream:
+  reruns are identical, both hemispheres of an event go together, and a larger
+  `L` keeps a superset of a smaller one.
+- Needs no EOS and no ROOT: it reads the memory-mapped parent and writes an
+  ordinary index (own `index_id`, same file table) that `run3-mj-match`, gather,
+  assemble and `run3-mj-mixqa index` take unchanged. The manifest's `subsample`
+  block records `L`, the seed, the dropped datasets and per-dataset
+  kept/expected/total rows; `parent_index` records where it came from.
+- Fill the resulting pseudo-events with **unit weight**
+  (`make_histograms.py --weight-power 0`): each one then counts events at `L`.
+
 ## 7. Stage 2 — match (login node)
 
 ```bash
